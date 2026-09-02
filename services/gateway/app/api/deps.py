@@ -1,0 +1,47 @@
+"""
+Dependency injection wiring for the web layer.
+
+FastAPI's `Depends` lets a route declare *what* it needs (a JobRepository)
+without knowing *how* it's built. These provider functions do the building:
+open a DB session for the request, wrap it in the Postgres adapter, and hand it
+over. Because the route depends on the port type, tests can override
+`get_job_repository` with the in-memory adapter and nothing else changes.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+
+from fastapi import Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.adapters.postgres.repository import PostgresJobRepository
+from app.core.db import get_sessionmaker
+from app.ports.job_repository import JobRepository
+
+
+async def get_session() -> AsyncIterator[AsyncSession]:
+    """One database session per request.
+
+    The `async with` block guarantees the session is closed afterwards. We
+    commit if the handler succeeded and roll back if it raised — the classic
+    unit-of-work pattern, so a request either fully applies or not at all.
+    """
+    async with get_sessionmaker()() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+
+def get_job_repository(
+    session: AsyncSession = Depends(get_session),
+) -> JobRepository:
+    """Provide the concrete repository the routes will use.
+
+    Return type is the PORT (`JobRepository`), not the concrete class — the
+    routes only ever see the interface.
+    """
+    return PostgresJobRepository(session)
