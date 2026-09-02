@@ -14,6 +14,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.domain.events import JobEvent, JobEventType
 from app.domain.job import Job, JobStatus
 
 
@@ -25,13 +26,18 @@ class JobCreate(BaseModel):
     payload: dict = Field(..., min_length=1, description="the work to perform")
 
 
-class JobTransition(BaseModel):
-    """Request body for POST /v1/jobs/{id}/transition."""
+class JobEventOut(BaseModel):
+    """One entry of a job's event log (GET /v1/jobs/{id}/events)."""
 
-    to: JobStatus = Field(..., description="target status")
-    # The client tells us which version it based this change on. That's what
-    # makes the write safe under concurrency (optimistic concurrency control).
-    expected_version: int = Field(..., ge=1, description="version the client last saw")
+    model_config = ConfigDict(from_attributes=True)
+
+    type: JobEventType
+    at: datetime
+    data: dict
+
+    @classmethod
+    def from_entity(cls, event: JobEvent) -> "JobEventOut":
+        return cls.model_validate(event)
 
 
 class JobOut(BaseModel):

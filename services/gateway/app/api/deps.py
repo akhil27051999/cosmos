@@ -11,12 +11,17 @@ over. Because the route depends on the port type, tests can override
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from functools import lru_cache
 
 from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.adapters.postgres.event_store import PostgresEventStore
 from app.adapters.postgres.repository import PostgresJobRepository
+from app.application.job_service import JobService
 from app.core.db import get_sessionmaker
+from app.ports.event_store import EventStore
+from app.ports.job_queue import JobQueue
 from app.ports.job_repository import JobRepository
 
 
@@ -45,3 +50,34 @@ def get_job_repository(
     routes only ever see the interface.
     """
     return PostgresJobRepository(session)
+
+
+def get_event_store(session: AsyncSession = Depends(get_session)) -> EventStore:
+    # FastAPI caches `get_session` within a request, so the repository and the
+    # event store share ONE session — their writes commit together.
+    return PostgresEventStore(session)
+
+
+@lru_cache
+def _get_redis():
+    """One Redis client (connection pool) per process, created on first use."""
+    from redis.asyncio import Redis  # lazy: keeps redis out of test imports
+
+    from app.core.config import get_settings
+
+    return Redis.from_url(get_settings().redis_url, decode_responses=True)
+
+
+def get_job_queue() -> JobQueue:
+    from app.adapters.redis.queue import RedisJobQueue  # lazy import
+
+    # The API only ever enqueues, so its consumer name is cosmetic.
+    return RedisJobQueue(_get_redis(), consumer_name="api")
+
+
+def get_job_service(
+    repo: JobRepository = Depends(get_job_repository),
+    events: EventStore = Depends(get_event_store),
+    queue: JobQueue = Depends(get_job_queue),
+) -> JobService:
+    return JobService(repo, events, queue)

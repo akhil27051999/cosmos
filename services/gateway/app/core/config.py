@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://cosmos:cosmos@localhost:5432/cosmos"
     db_echo: bool = False                  # set true to see every SQL statement
 
+    # Redis, used as the durable job queue (Redis Streams) in Stage 1.
+    redis_url: str = "redis://localhost:6379/0"
+
     log_level: str = "INFO"
 
 
