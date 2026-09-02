@@ -1,0 +1,6 @@
+# local env & caches — don't commit these
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env

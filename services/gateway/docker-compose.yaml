@@ -1,0 +1,38 @@
+# Stage-0 local stack: the gateway + its Postgres.
+# Run from services/gateway:   docker compose up --build
+# Then open http://localhost:8000/docs
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cosmos
+      POSTGRES_PASSWORD: cosmos
+      POSTGRES_DB: cosmos
+    ports:
+      - "5432:5432"
+    healthcheck:
+      # The gateway waits for this to pass before starting, so it never races
+      # the database on boot.
+      test: ["CMD-SHELL", "pg_isready -U cosmos -d cosmos"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  gateway:
+    build: .
+    environment:
+      # host is the compose service name `postgres`, not localhost
+      DATABASE_URL: postgresql+asyncpg://cosmos:cosmos@postgres:5432/cosmos
+      APP_ENV: local
+      DB_ECHO: "false"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
