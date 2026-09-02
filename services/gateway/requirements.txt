@@ -5,6 +5,7 @@ pydantic==2.10.4
 pydantic-settings==2.7.1
 sqlalchemy[asyncio]==2.0.36
 asyncpg==0.30.0
+redis==5.2.1
 
 # --- tests (fine to keep here for a learning project; split into
 #     requirements-dev.txt later if you want a lean runtime image) ---

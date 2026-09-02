@@ -1,6 +1,8 @@
-# Stage-0 local stack: the gateway + its Postgres.
+# Stage-1 local stack: gateway (API) + worker + Postgres + Redis.
 # Run from services/gateway:   docker compose up --build
-# Then open http://localhost:8000/docs
+#   API docs:  http://localhost:8000/docs
+# The API and the worker are the SAME image, started with different commands.
+# (Stage 7 later extracts the worker into its own service.)
 
 services:
   postgres:
@@ -12,8 +14,6 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      # The gateway waits for this to pass before starting, so it never races
-      # the database on boot.
       test: ["CMD-SHELL", "pg_isready -U cosmos -d cosmos"]
       interval: 3s
       timeout: 3s
@@ -21,17 +21,41 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
   gateway:
     build: .
     environment:
-      # host is the compose service name `postgres`, not localhost
       DATABASE_URL: postgresql+asyncpg://cosmos:cosmos@postgres:5432/cosmos
+      REDIS_URL: redis://redis:6379/0
       APP_ENV: local
-      DB_ECHO: "false"
     ports:
       - "8000:8000"
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]   # same image, different entrypoint
+    environment:
+      DATABASE_URL: postgresql+asyncpg://cosmos:cosmos@postgres:5432/cosmos
+      REDIS_URL: redis://redis:6379/0
+      APP_ENV: local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
 volumes:
