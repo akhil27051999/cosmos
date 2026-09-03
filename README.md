@@ -30,8 +30,8 @@ As later stages arrive, `services/` grows (e.g. a `worker/`), and a top-level
 |-------|------|--------|
 | **0** | FastAPI + clean (hexagonal) architecture; Jobs API; idempotency; optimistic concurrency; error envelope; health probes | ✅ built |
 | **1** | Accept-fast (`202 + id`); Redis-Streams queue + worker; state machine driven by the worker; append-only event log; at-least-once + idempotent; cancellation | ✅ built |
-| 2 | Polyglot persistence (MongoDB trajectories, Redis hot state) | ⬜ |
-| 3 | The agent loop (Claude + tools + RAG) with SSE streaming | ⬜ |
+| **2** | Polyglot persistence: MongoDB for the job document (payload + result), Redis hot-state cache (cache-aside + invalidate-on-write) | ✅ built |
+| **3** | The agent layer: real Claude agent loop (tool use + token budget), trajectory persisted to Mongo, live SSE streaming | ✅ built |
 | 4 | Resilience: rate-limit, circuit breaker, retry+jitter, fallback, load-shed | ⬜ |
 | … | Kafka/CQRS/Saga → multi-tenancy → gRPC/Go/mesh → k8s operator → frontend/A-B → preview envs → cloud/multi-region → observability/SRE | ⬜ |
 
@@ -42,7 +42,7 @@ cd services/gateway
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 pytest                       # fast, no database needed
-docker compose up --build    # gateway + worker + Postgres + Redis → http://localhost:8000/docs
+docker compose up --build    # gateway + worker + Postgres + Redis + MongoDB → http://localhost:8000/docs
 ```
 
 > Local-only. Not a git repo — initialize and commit on your own when you're

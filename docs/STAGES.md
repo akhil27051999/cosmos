@@ -183,7 +183,180 @@ docker compose restart worker
 
 ---
 
-## Stage 2 — polyglot persistence ⬜ (next)
+## Stage 2 — polyglot persistence ✅
 
-Will add MongoDB for job trajectories/payloads and Redis for hot state, with the
-"why polyglot persistence" reasoning. Steps appended when it lands.
+**What it adds:** the *right database for each data shape*.
+
+- **Postgres** — the transactional core: `jobs` metadata + `job_events` log (unchanged).
+- **MongoDB** — the big document per job: the input **`payload`** (moved out of Postgres) + the worker's **`result`**.
+- **Redis** — a **hot-state cache** for `GET /v1/jobs/{id}` (cache-aside on reads, invalidate-on-write in `JobService`).
+
+**New concepts (and where they live)**
+
+| Concept | Where |
+|---|---|
+| Job document (payload + result) | `app/domain/document.py`, `app/ports/document_store.py` |
+| MongoDB adapter (embed, one doc per job) | `app/adapters/mongo/document_store.py` |
+| Hot-state cache port | `app/ports/cache.py` |
+| Redis cache adapter (JSON + TTL) | `app/adapters/redis/cache.py` |
+| Cache-aside read | `get_job` in `app/api/routes_jobs.py` |
+| Invalidate-on-write | `JobService._transition` |
+| Payload moved out of Postgres | `domain/job.py`, `adapters/postgres/{models,repository}.py` |
+
+**New endpoint:** `GET /v1/jobs/{id}/document` → the payload + result from Mongo.
+
+### Test steps
+
+**A. Automated (no infra — seconds)**
+```bash
+cd services/gateway
+source .venv/bin/activate
+pip install -r requirements.txt      # now also installs motor
+pytest -v
+```
+Expect **17 passed** (adds 3 document tests + 2 cache tests). They use the
+in-memory document store and cache — no Mongo/Redis needed.
+
+**B. End-to-end (Docker — now also starts MongoDB)**
+```bash
+cd services/gateway
+docker compose up --build            # postgres + redis + mongo + gateway + worker
+```
+```bash
+# submit a job (payload goes to Mongo)
+curl -si -XPOST localhost:8000/v1/jobs -H 'content-type: application/json' \
+  -d '{"payload":{"task":"demo","n":21}}'      # grab <ID>
+
+# the document (payload now; result appears after the worker runs ~1s later)
+curl -s localhost:8000/v1/jobs/<ID>/document ; echo
+# -> {"job_id":"...","payload":{"task":"demo","n":21},"result":{"echo":{...},"processed":true},...}
+
+# metadata read (served via the Redis cache on repeat calls)
+curl -s localhost:8000/v1/jobs/<ID> ; echo
+```
+
+**C. See the polyglot split for yourself**
+```bash
+# Postgres has metadata only — no payload column anymore:
+docker compose exec postgres psql -U cosmos -d cosmos -c "\d jobs"
+# Mongo has the document:
+docker compose exec mongo mongosh cosmos --quiet --eval 'db.job_documents.find().pretty()'
+# Redis has the cached job (briefly, ~30s TTL) after you GET it:
+docker compose exec redis redis-cli --scan --pattern 'job:*'
+```
+
+**What to verify (learning checkpoints)**
+- `\d jobs` shows **no `payload` column** — it's in Mongo now.
+- `GET /{id}/document` returns the payload immediately, and the `result` after the worker finishes.
+- Repeated `GET /{id}` is a cache hit (add `DB_ECHO=true` to watch Postgres go quiet on the 2nd call).
+- After a `cancel`, the next `GET /{id}` shows `cancelled` (cache was invalidated, not stale).
+
+### Troubleshooting
+
+| Symptom | Cause & fix |
+|---|---|
+| `pip install` fails on **motor/pymongo** (new Python) | Same as before: use Docker (Python 3.12) or a 3.12 venv. Tests don't need motor. |
+| Worker can't reach Mongo / jobs never get a `result` | Check `MONGO_URL` (host `mongo` in compose, `localhost` locally). `docker compose logs mongo`. |
+| `GET /{id}/document` returns 404 for a real job | The Mongo doc wasn't written (submit failed after the Postgres insert, or you're pointing at the wrong Mongo DB). Check `MONGO_DB=cosmos` and `docker compose logs gateway`. |
+| `GET /{id}` shows a stale status | Invalidation didn't run. Confirm the write went through `JobService` (routes/worker both do). The Redis TTL (~30s) is the backstop. |
+| Orphan documents in Mongo | A submit wrote the doc but the Postgres insert failed (rare race). Harmless; the transactional outbox in Stage 5 closes this. |
+| `mongosh` not found in the container | Use `docker compose exec mongo mongosh …` (the `mongo:7` image ships `mongosh`). |
+
+---
+
+## Stage 3 — the agent layer ✅
+
+**What it adds:** the placeholder `echo` work becomes a **real Claude agent
+loop** — plan → call a tool → observe → repeat — bounded by a **token budget**,
+with the full **trajectory** stored in Mongo and streamed live over **SSE**.
+
+**New concepts (and where they live)**
+
+| Concept | Where |
+|---|---|
+| LLM behind a port (testable, swappable) | `app/ports/llm.py`, `app/adapters/anthropic/llm.py`, `app/adapters/memory/llm.py` (scripted fake) |
+| Tool abstraction + safe calculator | `app/agent/tools.py` |
+| Agent loop (plan→act→observe) + guardrails | `app/agent/loop.py` |
+| Token budget / max-steps / cooperative cancel | `run_agent` guardrails |
+| Trajectory persisted to Mongo | worker `_make_agent_work_fn` → `docs.set_result` |
+| Live streaming (SSE + Redis pub/sub) | `app/ports/stream_bus.py`, `app/adapters/redis/stream_bus.py`, `GET /v1/jobs/{id}/stream` |
+
+**New endpoint:** `GET /v1/jobs/{id}/stream` (Server-Sent Events).
+**New config:** `ANTHROPIC_API_KEY`, `AGENT_MODEL` (default `claude-opus-5`), `AGENT_MAX_TOKENS`, `AGENT_MAX_STEPS`, `AGENT_TOKEN_BUDGET`.
+
+### Test steps
+
+**A. Automated (no API key, no cost — seconds)**
+```bash
+cd services/gateway
+source .venv/bin/activate
+pip install -r requirements.txt      # now also installs anthropic
+pytest -v
+```
+Expect **26 passed** (adds agent-loop + tool + streaming tests). They use a
+**scripted fake LLM**, so no Anthropic key or network is needed.
+
+**B. End-to-end with the real agent (Docker — needs your API key)**
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...          # your key
+# optional, to cut cost while testing:
+export AGENT_MODEL=claude-sonnet-5
+cd services/gateway
+docker compose up --build
+docker compose logs -f worker
+```
+Submit a task and read the trajectory:
+```bash
+ID=$(curl -s -X POST localhost:8000/v1/jobs -H 'content-type: application/json' \
+  -d '{"payload":{"prompt":"What is 21 * 2? Use the calculator."}}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])'); echo "job=$ID"
+
+curl -s localhost:8000/v1/jobs/$ID/document | python3 -m json.tool
+# -> result.answer = "42", result.trajectory = [assistant, tool_call, tool_result, final], result.usage = {...}
+```
+
+**B2. FREE alternative — run the agent on Groq (no credit card)**
+
+Because the LLM is behind a port, you can swap providers with an env switch —
+no code change. Get a free key at **console.groq.com** (API Keys → Create), then:
+```bash
+export LLM_PROVIDER=groq
+export GROQ_API_KEY=gsk_...
+# optional: export GROQ_MODEL=llama-3.3-70b-versatile   (default; supports tools)
+cd services/gateway
+docker compose up --build
+```
+Everything else (submit, `/document`, `/stream`) works identically — the worker
+just uses `GroqLLMClient` instead of `AnthropicLLMClient`. Switch back any time
+with `LLM_PROVIDER=anthropic`.
+
+**C. Watch the agent think live (SSE)**
+```bash
+# open the stream FIRST (it's live-only), then submit in another terminal
+curl -N localhost:8000/v1/jobs/$ID/stream
+# streams: data: {"type":"tool_call",...}  /  {"type":"tool_result",...}  /  {"type":"final",...}  /  {"type":"end",...}
+```
+
+**What to verify (learning checkpoints)**
+- With no tools needed, the agent answers directly; with math, it **calls the calculator** (see `tool_call`/`tool_result` in the trajectory).
+- `result.usage.total` reports tokens spent; a tiny `AGENT_TOKEN_BUDGET` makes the job stop early (`stopped: "budget"`, job `FAILED`).
+- The SSE stream shows steps arriving in real time, ending with `end`.
+
+### Troubleshooting
+
+| Symptom | Cause & fix |
+|---|---|
+| Job goes `failed`, worker logs `401`/authentication error | `ANTHROPIC_API_KEY` missing or wrong. `export` it in the shell you run `docker compose up` from (compose passes it through). |
+| `model ... does not exist or you do not have access` (404) | The model id isn't available to your key (catalogs change). **Anthropic:** set `AGENT_MODEL` to one you have (`claude-sonnet-5`, `claude-haiku-4-5`). **Groq:** list yours with `curl -s https://api.groq.com/openai/v1/models -H "Authorization: Bearer $GROQ_API_KEY"` and set `GROQ_MODEL` to a tool-capable one (e.g. `openai/gpt-oss-20b`). Then `docker compose up -d`. The job fails cleanly with the exact error in its event log. |
+| Cost higher than expected | Default is `claude-opus-5` with adaptive thinking. Set `AGENT_MODEL=claude-haiku-4-5` and/or lower `AGENT_TOKEN_BUDGET` for cheap testing. |
+| `pip install` fails building a wheel | You're on Python 3.13/3.14. Use a **3.12** venv (`python3.12 -m venv .venv`) or Docker. |
+| SSE shows nothing | It's **live-only** — connect *before/while* the job runs. If the job already finished, read `GET /{id}/document` for the stored trajectory instead. |
+| Job `failed` with `agent stopped: max_steps` / `budget` / `refusal` | The agent hit a guardrail (that's by design). Raise `AGENT_MAX_STEPS` / `AGENT_TOKEN_BUDGET`, or refine the prompt. The partial trajectory is still in Mongo. |
+
+---
+
+## Stage 4 — resilience ⬜ (next)
+
+Will wrap the provider calls with a rate limiter, circuit breaker, retries
+(backoff + jitter), a fallback chain, and load shedding. Steps appended when it
+lands.

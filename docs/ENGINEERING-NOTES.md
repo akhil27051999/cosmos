@@ -16,6 +16,8 @@
 3. The two request flows (submit & worker)
 4. **Stage 0** — the clean foundation (block-by-block)
 5. **Stage 1** — the async core (block-by-block)
+5B. **Stage 2** — polyglot persistence (block-by-block)
+5C. **Stage 3** — the agent layer (block-by-block)
 6. Cross-cutting design decisions & trade-offs
 7. Interview Q&A — what / why / how
 8. Known gaps and what later stages fix
@@ -426,6 +428,161 @@ cancellation.
 
 ---
 
+## 5B. Stage 2 — polyglot persistence (block-by-block)
+
+**Idea:** stop forcing every kind of data into Postgres. Use the *right database
+for each data shape*. **Motive:** learn and defend polyglot persistence, MongoDB
+document modelling, and caching — the "data-at-scale" gap.
+
+**The split:**
+- **Postgres** — small, structured, transactional **metadata** (`jobs`) + the ordered `job_events` log. Needs uniqueness, ordering, transactions.
+- **MongoDB** — the large, nested, schema-varying **document**: the input `payload` (moved out of Postgres) + the worker's `result`/trajectory. No joins needed.
+- **Redis** — a **hot-state cache** for job reads.
+
+### 5B.1 `app/domain/document.py` — the JobDocument
+- **`@dataclass JobDocument {job_id, payload, result, created_at, updated_at}`** —
+  the "big" part of a job, pure Python. *Why separate from `Job`:* payload/result
+  are large and vary by job type; the `Job` entity keeps only metadata. *Benefit:*
+  each store holds what it's good at.
+
+### 5B.2 `app/ports/document_store.py` & `cache.py` — two new ports
+- **`JobDocumentStore` (`create`, `set_result`, `get`)** — the interface for the
+  big document; adapters are Mongo (real) and in-memory (tests).
+- **`JobCache` (`get`, `set`, `invalidate`)** — the interface for the hot cache.
+  *Design stated in the docstring:* the cache is **never the source of truth**
+  (cache-aside); correctness comes from **invalidate-on-write**. *Benefit:* you
+  can wipe Redis anytime and the system still works from Postgres.
+
+### 5B.3 In-memory adapters (`adapters/memory/document_store.py`, `cache.py`)
+- Dict-backed implementations for tests. The cache one adds `hits`/`misses`
+  counters so tests can *prove* cache-aside behaviour. *Benefit:* the whole
+  polyglot flow is tested with zero infrastructure.
+
+### 5B.4 `app/adapters/mongo/document_store.py` — MongoDB adapter
+- **one document per job, `_id = str(job_id)`, payload+result inline** — the
+  classic Mongo "**embed, don't join**" model: fetch everything about a job's data
+  in one round trip. *Why Mongo:* schema-flexible, document-shaped, no relational
+  joins. **`set_result` uses `upsert=True`** — safe even if create didn't land.
+- Uses `motor`, the async Mongo driver (lazy-imported in `deps`).
+
+### 5B.5 `app/adapters/redis/cache.py` — Redis cache adapter
+- **JSON-serialises the job under `job:{id}` with a short TTL (`ex=30`)** — a burst
+  of polls is served from Redis, not Postgres. *Why a TTL:* a safety net — even if
+  an invalidation is somehow missed, the entry self-expires. The port speaks in
+  domain `Job`, so (de)serialization is hidden here.
+
+### 5B.6 The Postgres change — `jobs` becomes metadata-only
+- **`domain/job.py`** drops the `payload` field; **`adapters/postgres/models.py`**
+  drops the `payload` column; **`repository.py`** stops mapping it. *Why:* the
+  payload now lives in Mongo. *Benefit:* the relational row is small and purely
+  transactional. (In real life this is an Alembic migration — noted as a gap.)
+
+### 5B.7 `app/application/job_service.py` — the coordination changes
+- **`submit` writes the Mongo document FIRST**, then the Postgres row + event +
+  enqueue. *Why that order:* the payload must exist before the job is
+  visible/enqueued (the worker reads it from Mongo). If the Postgres insert then
+  fails, the Mongo doc is a harmless orphan.
+- **`_transition` calls `cache.invalidate(job.id)`** after every state change —
+  invalidate-on-write.
+- **The consistency note (interview gold):** a submit touches THREE stores (Mongo,
+  Postgres, Redis) and only the Postgres writes are transactional. Small crash
+  windows exist (orphan doc; committed-but-not-enqueued). The full fix is the
+  transactional **outbox + CDC** in Stage 5. Naming this shows you understand
+  distributed-data consistency.
+
+### 5B.8 `app/api/deps.py`, `routes_jobs.py`, `schemas.py`
+- **deps:** `_get_mongo_client` (lazy singleton), `get_document_store`,
+  `get_job_cache`; `get_job_service` now wires docs + cache.
+- **routes:** `get_job` is now **cache-aside** (try cache → miss → Postgres →
+  populate); new **`GET /{id}/document`** returns the Mongo doc.
+- **schemas:** `JobDocumentOut` DTO.
+
+### 5B.9 `app/worker.py` — the worker changes
+- **`process_job` now takes `cache`** and builds `JobService(repo, events,
+  cache=cache)` — so the worker's own transitions invalidate the cache too.
+  *Why it matters:* otherwise an API read could serve a stale status after the
+  worker advanced the job.
+- **`_make_work_fn(repo, docs)`** now reads the `payload` from Mongo, "works", and
+  writes a `result` document — the shape the real agent loop (Stage 3) will fill.
+
+---
+
+## 5C. Stage 3 — the agent layer (block-by-block)
+
+**Idea:** replace the placeholder work with a real **agent** — a model that
+plans, calls tools, observes results, and iterates until it answers — then
+persist and stream everything it does. **Motive:** this is the platform's reason
+to exist and the deepest interview area (the agent/LLM layer).
+
+### 5C.1 `app/ports/llm.py` — the LLMClient port
+- **`LLMClient.create_turn(system, messages, tools, max_tokens) -> LLMTurn`** —
+  one model round-trip. `LLMTurn` carries the assistant `text`, any `tool_calls`,
+  the `stop_reason`, token `usage`, and `raw_assistant_content` (opaque blocks to
+  replay next turn). *Why a port here matters most:* the real adapter costs money
+  and needs a key — the port lets tests use a **scripted fake**. Provider-swap is
+  also just a new adapter.
+
+### 5C.2 `app/adapters/anthropic/llm.py` — the real client
+- The **only** file that imports the Anthropic SDK. `messages.create(...)`, then
+  normalise `resp.content` blocks into text + `ToolCall`s, and keep `resp.content`
+  as `raw_assistant_content` so tool_use (and thinking) blocks replay correctly.
+  Model from config (default `claude-opus-5`, overridable to cut cost). Lazy-
+  imported, so tests never load the SDK.
+
+### 5C.2b `app/adapters/groq/llm.py` — a FREE provider (the ports payoff, live)
+- A second real `LLMClient` — Groq's OpenAI-compatible API (free tier, no card).
+  It **translates** the loop's Anthropic-shaped messages/tools into OpenAI shape
+  and maps the response back, so the agent loop, worker, and tests are unchanged.
+  Selected with `LLM_PROVIDER=groq`. *This is the concrete proof of the port:*
+  a new provider = one new adapter + a config switch, nothing else. The
+  translation helpers are pure functions (unit-tested without the SDK).
+
+### 5C.3 `app/adapters/memory/llm.py` — the scripted fake
+- **`ScriptedLLMClient([turns...])`** returns pre-programmed turns in order,
+  ignoring the messages. *Benefit:* deterministic tests of every path (direct
+  answer, tool-use, refusal, budget) with no key, no network, no cost.
+
+### 5C.4 `app/agent/tools.py` — the tool abstraction
+- **`Tool {name, description, input_schema, run}`** — description + schema go to
+  the model (so it knows when/how to call), `run` is what *we* execute. The model
+  decides; our code executes — the core of safe tool use.
+- **`calculator`** evaluates arithmetic via a **restricted AST walk**, not
+  `eval` — the model can't smuggle code through it. Deterministic + side-effect-
+  free, so the loop is easy to test.
+
+### 5C.5 `app/agent/loop.py` — the agent loop
+- **`run_agent(task, *, llm, tools, ...)`** — the plan→act→observe cycle: call
+  the model; if `stop_reason == "tool_use"`, run each tool and feed the results
+  back as a `tool_result` user message; repeat until `end_turn`. It appends the
+  raw assistant content before the tool results (correct replay), records every
+  step into a **trajectory**, and calls `on_step` per step (for live streaming).
+- **Guardrails (why an agent needs them):** a **token budget** (hard ceiling on
+  total tokens → no runaway spend), **max steps** (no infinite loop), and
+  **cooperative cancellation** (`should_cancel` checked between steps). Each stop
+  reason is recorded (`done`/`budget`/`max_steps`/`refusal`/`cancelled`).
+- **Refusal handling:** `stop_reason == "refusal"` is checked before reading
+  content, and ends the loop cleanly.
+
+### 5C.6 Streaming — `ports/stream_bus.py` + adapters
+- **`StreamBus.publish/subscribe`** — the worker (which runs the agent) publishes
+  each step; the gateway's SSE endpoint subscribes and forwards. Cross-process in
+  real runs → **Redis pub/sub** (`adapters/redis/stream_bus.py`); one-process in
+  tests → **in-memory** (`adapters/memory/stream_bus.py`). A terminal
+  `{"type":"end"}` closes the stream.
+- **`GET /v1/jobs/{id}/stream`** returns a `StreamingResponse` of
+  `text/event-stream`, yielding `data: {json}\n\n` per event. *Known gap:* it's
+  live-only (no replay of steps emitted before you connect) — a production version
+  would replay the Mongo trajectory first, then go live.
+
+### 5C.7 `app/worker.py` — wiring the agent in
+- **`_make_agent_work_fn(repo, docs, bus, llm, settings)`** replaces the echo:
+  read the task from the payload, run `run_agent` with `on_step` publishing to the
+  bus and `should_cancel` re-reading the job, then store `{answer, trajectory,
+  usage, stopped}` to Mongo and publish `end`. A non-`done` stop **raises**, so
+  `process_job` marks the job `FAILED` with the reason.
+
+---
+
 ## 6. Cross-cutting design decisions & trade-offs
 
 | Decision | Why | Trade-off / later fix |
@@ -440,6 +597,13 @@ cancellation.
 | Redis Streams queue | durable, at-least-once, simple | not a full log/replay bus → Kafka in Stage 5 |
 | Worker inside gateway package | one deployable early | split into own Go service in Stage 7 |
 | Enqueue outside the DB tx | simple | crash window → **transactional outbox** in Stage 5 |
+| Polyglot: payload/result in Mongo | document-shaped, schema-flexible, no joins | multi-store writes aren't atomic → outbox/CDC (Stage 5) |
+| Redis cache-aside + invalidate-on-write | fast reads, absorb poll storms | cache can briefly lag; TTL is the backstop |
+| Cache also invalidated by the worker | reads never serve a stale status | worker must know the cache (threaded in) |
+| LLM behind a port + scripted fake | tests run with no key/network/cost | one more abstraction layer |
+| Agent guardrails (token budget, max steps) | bound cost + prevent infinite loops | may stop before a hard task finishes |
+| SSE via Redis pub/sub | live progress across processes | live-only (no replay) until Stage 5-style history stream |
+| Manual agent loop (not the SDK tool-runner) | full control to record + stream each step | more code than the runner |
 
 ---
 
@@ -493,21 +657,85 @@ The domain and use cases depend on interfaces (`JobRepository`, `EventStore`,
 API and worker logic is verified in milliseconds with no infrastructure — and
 Stage 5 can replace Redis with Kafka by writing one new adapter.
 
+**Q: Why did you move the payload to MongoDB instead of keeping it in Postgres?**
+Data-shape fit. The payload/result are large, deeply nested, and vary by job
+type, and I never join on them — that's a document, not a relational row. So they
+live in Mongo (one document per job, embedded), while the small transactional
+metadata (status, version, idempotency key) stays in Postgres where uniqueness,
+ordering, and transactions matter. Right database per data shape.
+
+**Q: A submit now writes to Mongo, Postgres, and Redis — how do you keep them
+consistent?**
+I don't get a distributed transaction across them, and I say so. I order the
+writes to fail safe: the Mongo document first (so the payload exists before the
+job is visible), then the Postgres row + event (one transaction), then the
+enqueue. The leftover windows (an orphan Mongo doc, or committed-but-not-enqueued)
+are bounded and the worker treats an unknown id as a no-op. The correct fix is a
+transactional **outbox + change-data-capture** in Stage 5.
+
+**Q: How does the cache stay correct?**
+Cache-aside for reads (try Redis, miss → Postgres → populate) and
+invalidate-on-write for changes: `JobService` deletes the cache entry on every
+transition, and the **worker uses a cache-aware JobService too**, so a status it
+advances is invalidated immediately. A short Redis TTL is the backstop if an
+invalidation is ever missed. The cache is never the source of truth.
+
+**Q: Mongo modelling — embed or reference?**
+Embed. Everything about a job's data is one document keyed by the job id, fetched
+in a single round trip. There's no cross-document relationship that would justify
+references/joins here — that's exactly the workload document DBs are best at.
+
+**Q: Walk me through the agent loop.**
+Given a task, `run_agent` calls the model through the `LLMClient` port. If the
+model returns `tool_use`, I run each requested tool locally, append the raw
+assistant turn plus a `tool_result` message, and call again — plan → act →
+observe. It repeats until `end_turn` (final answer) or a guardrail fires. Every
+step is recorded to a trajectory and emitted via `on_step` for live streaming.
+
+**Q: How do you stop an agent from running away (cost/loops)?**
+Three guardrails: a **token budget** (sum of input+output tokens across the loop;
+stop when exceeded), a **max-steps** cap (no infinite loop), and **cooperative
+cancellation** (re-check the job's status between steps). Each produces a
+distinct, recorded stop reason, and a non-`done` stop marks the job failed with
+that reason.
+
+**Q: How is any of this testable without an API key?**
+The model is behind the `LLMClient` port. Tests inject a `ScriptedLLMClient` that
+returns canned turns — so I can drive the exact tool-use, refusal, and
+budget-exceeded paths deterministically, with no key, network, or cost. The
+Anthropic adapter is the only thing that touches the SDK.
+
+**Q: How does the live SSE stream work if the agent runs in the worker?**
+The worker publishes each step to a `StreamBus`; the gateway's SSE endpoint
+subscribes and forwards. Across processes that's Redis pub/sub; the API just
+relays `data: {json}` frames. It's live-only today (a known gap) — production
+would replay the stored trajectory from Mongo first, then go live.
+
+**Q: Is tool use safe?**
+The model only *requests* a tool; our code decides whether/how to run it. The
+calculator evaluates via a restricted AST (numbers + operators only), never
+`eval`, so the model can't execute arbitrary code. Tools are deterministic and
+side-effect-free at this stage.
+
 **Q: What are the known weaknesses?**
-(1) Enqueue is outside the DB transaction → a crash window where a job is
-committed but not queued; fixed by the transactional outbox in Stage 5.
-(2) `create_all()` isn't migration-safe → Alembic later. (3) The worker shares the
-gateway's package → split into its own service in Stage 7. Naming these
-unprompted signals seniority.
+(1) Multi-store writes (Mongo/Postgres/Redis) aren't atomic → transactional
+outbox + CDC in Stage 5. (2) Enqueue is outside the DB transaction → same fix.
+(3) Schema changes use `create_all()`, not migrations → Alembic. (4) The worker
+shares the gateway's package → split into its own service in Stage 7. (5) The SSE
+stream is live-only (no replay). (6) No retry/backoff around the model call yet →
+Stage 4 resilience. Naming these unprompted signals seniority.
 
 ---
 
 ## 8. Known gaps and what later stages fix
+- **MongoDB trajectories + Redis hot state** (polyglot) → **Stage 2**. ✅ done
+- **Multi-store consistency** (Mongo+Postgres+Redis not atomic) → transactional **outbox + CDC**, **Stage 5**.
 - **Transactional outbox** (enqueue-in-transaction) → **Stage 5**.
-- **Alembic migrations** (vs `create_all`) → early Stage 2/3 housekeeping.
-- **Real work** (Claude agent loop + RAG) replacing the placeholder → **Stage 3**.
-- **Retries/backoff/circuit breaker** around failures → **Stage 4**.
-- **MongoDB trajectories + Redis hot state** (polyglot) → **Stage 2**.
+- **Alembic migrations** (vs `create_all`) → housekeeping, next.
+- **Real work** (Claude agent loop + tool use) replacing the echo placeholder → **Stage 3**. ✅ done
+- **RAG** (embeddings + vector retrieval) added to the agent → later in Stage 3/expansion.
+- **SSE trajectory replay** (not just live) → Stage 5-style history stream.
+- **Retries/backoff/circuit breaker** around the model/provider calls → **Stage 4**.
 - **Kafka backbone, CQRS read models, CDC** → **Stage 5**.
 
 ## 9. Glossary

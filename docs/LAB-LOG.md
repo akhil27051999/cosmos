@@ -168,6 +168,75 @@ docker compose exec redis redis-cli --scan --pattern 'job:*'   # cached jobs (af
 
 ---
 
+## 5b. Stage 3 — running the agent (agent, SSE, provider setup)
+
+**Concept:** the worker now runs a real LLM agent loop. It needs a model
+provider. The LLM is behind a port, so you pick the provider with an env var —
+Anthropic (paid) or **Groq (free, no card)** — without any code change.
+
+**Choose a provider (env vars the worker reads):**
+```bash
+# Option 1 — Groq (free). Get a key at console.groq.com -> API Keys.
+export LLM_PROVIDER=groq
+export GROQ_API_KEY=gsk_...
+export GROQ_MODEL=openai/gpt-oss-20b        # must be a tool-capable model on YOUR account
+
+# Option 2 — Anthropic (paid). Key at console.anthropic.com.
+# export LLM_PROVIDER=anthropic
+# export ANTHROPIC_API_KEY=sk-ant-...
+# export AGENT_MODEL=claude-haiku-4-5
+```
+
+**List the models your Groq key can actually use** (the catalog changes; a wrong
+id returns 404):
+```bash
+curl -s https://api.groq.com/openai/v1/models -H "Authorization: Bearer $GROQ_API_KEY" \
+  | python3 -c 'import sys,json;[print(m["id"]) for m in json.load(sys.stdin)["data"]]'
+# pick a chat/tool model (e.g. openai/gpt-oss-20b, qwen/qwen3.8-27b);
+# skip whisper-* (speech), orpheus-* (TTS), *guard*/*safeguard* (safety), groq/compound* (built-in tools)
+```
+
+**(Re)start the worker with the provider env, then run a task:**
+```bash
+cd ~/Desktop/cosmos-platform/services/gateway
+docker compose up -d                        # recreates the worker with the new env
+
+# submit a task (the agent reads payload.prompt or payload.task)
+JOB=$(curl -s -XPOST localhost:8000/v1/jobs -H 'content-type: application/json' \
+  -d '{"payload":{"prompt":"What is 4839 * 271? Use the calculator tool, then state the result."}}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])'); echo "job=$JOB"
+sleep 4
+curl -s localhost:8000/v1/jobs/$JOB | python3 -m json.tool           # status -> succeeded
+curl -s localhost:8000/v1/jobs/$JOB/document | python3 -m json.tool  # result.answer + trajectory + usage
+```
+
+**Watch the agent think live (SSE).** It's live-only, so submit **and stream in
+one shot**; a multi-step prompt keeps it running long enough to catch the frames:
+```bash
+JOB=$(curl -s -XPOST localhost:8000/v1/jobs -H 'content-type: application/json' \
+  -d '{"payload":{"prompt":"Use the calculator for 12*12, then 144+56, then 200*3, and report all three."}}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])'); curl -N localhost:8000/v1/jobs/$JOB/stream
+# streams: tool_call -> tool_result -> assistant -> final -> end   (Ctrl+C to stop)
+```
+
+**What to verify (learning checkpoints):**
+- No-tool prompt -> `trajectory: [assistant, final]`. Math prompt -> `tool_call` -> `tool_result` -> `final` (the calculator ran).
+- `result.usage` reports tokens; `stopped: "done"` on success.
+- SSE frames arrive in real time, ending with `end`.
+
+**Gotchas we hit (and fixes):**
+| Symptom | Cause & fix |
+|---|---|
+| Job `failed`, event log shows `model ... does not exist or you do not have access` (404) | The `GROQ_MODEL` (or `AGENT_MODEL`) id isn't available to your key. List models (above) and pick a valid tool-capable one; `docker compose up -d` to reload. |
+| `curl -N .../stream` hangs with no output | The job already finished — SSE is live-only. Ctrl+C. Submit-then-stream in one command (above), or read the stored trajectory from `/document`. |
+| Job `failed` with an auth error | Wrong/missing provider key, or `LLM_PROVIDER` not set. Re-export and `docker compose up -d`. |
+
+> 🔐 Never paste an API key into a terminal command you share, or into chat. If
+> you do, treat it as compromised and rotate it (delete + recreate in the
+> provider console). Keys can live in a gitignored `services/gateway/.env`.
+
+---
+
 ## 6. Daily workflow cheat-sheet (once set up)
 
 ```bash
@@ -184,9 +253,10 @@ cd ~/Desktop/cosmos-platform/services/gateway && docker compose up -d && docker 
 docker compose down
 ```
 
-## 7. What exists now (created across Stages 0–2)
-- **Services:** `gateway` (FastAPI API) + `worker` (queue consumer) — one codebase, two processes.
-- **Stores:** Postgres (jobs + job_events), MongoDB (job_documents), Redis (job queue + cache).
-- **Endpoints:** `POST /v1/jobs`, `GET /v1/jobs`, `GET /v1/jobs/{id}`, `GET /v1/jobs/{id}/document`, `GET /v1/jobs/{id}/events`, `POST /v1/jobs/{id}/cancel`, `GET /healthz`, `GET /readyz`.
-- **Tests:** 17 passing (API, worker, documents, cache).
+## 7. What exists now (created across Stages 0–3)
+- **Services:** `gateway` (FastAPI API) + `worker` (queue consumer running the agent) — one codebase, two processes.
+- **Stores:** Postgres (jobs + job_events), MongoDB (job_documents + trajectory), Redis (job queue + cache + SSE pub/sub).
+- **Agent:** Claude/Groq agent loop (tool use + token budget), LLM behind a port, provider-swappable via `LLM_PROVIDER`.
+- **Endpoints:** `POST /v1/jobs`, `GET /v1/jobs`, `GET /v1/jobs/{id}`, `GET /v1/jobs/{id}/document`, `GET /v1/jobs/{id}/events`, `GET /v1/jobs/{id}/stream` (SSE), `POST /v1/jobs/{id}/cancel`, `GET /healthz`, `GET /readyz`.
+- **Tests:** 29 passing (API, worker, documents, cache, agent loop, tools, streaming, Groq translation).
 - **Docs:** this file + `ENGINEERING-NOTES.md` + `STAGES.md`.
