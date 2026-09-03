@@ -20,9 +20,12 @@ from app.adapters.postgres.event_store import PostgresEventStore
 from app.adapters.postgres.repository import PostgresJobRepository
 from app.application.job_service import JobService
 from app.core.db import get_sessionmaker
+from app.ports.cache import JobCache
+from app.ports.document_store import JobDocumentStore
 from app.ports.event_store import EventStore
 from app.ports.job_queue import JobQueue
 from app.ports.job_repository import JobRepository
+from app.ports.stream_bus import StreamBus
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
@@ -75,9 +78,41 @@ def get_job_queue() -> JobQueue:
     return RedisJobQueue(_get_redis(), consumer_name="api")
 
 
+@lru_cache
+def _get_mongo_client():
+    """One MongoDB client (connection pool) per process, created on first use."""
+    from motor.motor_asyncio import AsyncIOMotorClient  # lazy: keep motor out of test imports
+
+    from app.core.config import get_settings
+
+    return AsyncIOMotorClient(get_settings().mongo_url)
+
+
+def get_document_store() -> JobDocumentStore:
+    from app.adapters.mongo.document_store import MongoDocumentStore  # lazy import
+
+    from app.core.config import get_settings
+
+    return MongoDocumentStore(_get_mongo_client(), get_settings().mongo_db)
+
+
+def get_job_cache() -> JobCache:
+    from app.adapters.redis.cache import RedisJobCache  # lazy import
+
+    return RedisJobCache(_get_redis())
+
+
+def get_stream_bus() -> StreamBus:
+    from app.adapters.redis.stream_bus import RedisStreamBus  # lazy import
+
+    return RedisStreamBus(_get_redis())
+
+
 def get_job_service(
     repo: JobRepository = Depends(get_job_repository),
     events: EventStore = Depends(get_event_store),
     queue: JobQueue = Depends(get_job_queue),
+    docs: JobDocumentStore = Depends(get_document_store),
+    cache: JobCache = Depends(get_job_cache),
 ) -> JobService:
-    return JobService(repo, events, queue)
+    return JobService(repo, events, queue, docs, cache)

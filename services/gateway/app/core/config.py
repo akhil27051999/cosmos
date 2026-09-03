@@ -28,8 +28,26 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://cosmos:cosmos@localhost:5432/cosmos"
     db_echo: bool = False                  # set true to see every SQL statement
 
-    # Redis, used as the durable job queue (Redis Streams) in Stage 1.
+    # Redis, used as the durable job queue (Stage 1) and the hot-state cache (Stage 2).
     redis_url: str = "redis://localhost:6379/0"
+
+    # MongoDB, holds the large job documents (payload + result) — Stage 2.
+    mongo_url: str = "mongodb://localhost:27017"
+    mongo_db: str = "cosmos"
+
+    # Stage 3 — the agent layer.
+    # Pick the model provider: "anthropic" (default) or "groq" (free tier).
+    llm_provider: str = "anthropic"
+    # Anthropic:
+    anthropic_api_key: str = ""                 # from ANTHROPIC_API_KEY; blank => SDK default
+    agent_model: str = "claude-opus-5"          # override with AGENT_MODEL=claude-sonnet-5 to cut cost
+    # Groq (free): get a key at console.groq.com, set LLM_PROVIDER=groq.
+    groq_api_key: str = ""                       # from GROQ_API_KEY
+    groq_model: str = "llama-3.3-70b-versatile"  # a Groq model that supports tool use
+    # Shared agent guardrails:
+    agent_max_tokens: int = 4096                # per model turn
+    agent_max_steps: int = 8                    # loop iterations guardrail
+    agent_token_budget: int = 20_000            # total-token guardrail across the loop
 
     log_level: str = "INFO"
 

@@ -1,4 +1,4 @@
-# Stage-1 local stack: gateway (API) + worker + Postgres + Redis.
+# Stage-2 local stack: gateway (API) + worker + Postgres + Redis + MongoDB.
 # Run from services/gateway:   docker compose up --build
 #   API docs:  http://localhost:8000/docs
 # The API and the worker are the SAME image, started with different commands.
@@ -31,11 +31,25 @@ services:
       timeout: 3s
       retries: 10
 
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - mongodata:/data/db
+
   gateway:
     build: .
     environment:
       DATABASE_URL: postgresql+asyncpg://cosmos:cosmos@postgres:5432/cosmos
       REDIS_URL: redis://redis:6379/0
+      MONGO_URL: mongodb://mongo:27017
+      MONGO_DB: cosmos
       APP_ENV: local
     ports:
       - "8000:8000"
@@ -44,6 +58,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      mongo:
+        condition: service_healthy
 
   worker:
     build: .
@@ -51,12 +67,26 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://cosmos:cosmos@postgres:5432/cosmos
       REDIS_URL: redis://redis:6379/0
+      MONGO_URL: mongodb://mongo:27017
+      MONGO_DB: cosmos
       APP_ENV: local
+      # Stage 3: the worker runs the agent. Choose a provider with LLM_PROVIDER.
+      #   Anthropic (default): export ANTHROPIC_API_KEY (optionally AGENT_MODEL).
+      #   Groq (FREE, no card): set LLM_PROVIDER=groq and export GROQ_API_KEY
+      #     (get one at console.groq.com).
+      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AGENT_MODEL: ${AGENT_MODEL:-claude-opus-5}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      mongo:
+        condition: service_healthy
 
 volumes:
   pgdata:
+  mongodata:

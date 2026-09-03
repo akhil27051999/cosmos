@@ -21,6 +21,7 @@ only *starts* a job that is still PENDING.
 from __future__ import annotations
 
 import asyncio
+import json
 from enum import Enum
 
 import uuid
@@ -40,7 +41,9 @@ class ProcessResult(str, Enum):
     ABANDONED = "abandoned"      # cancelled part-way through; not completed
 
 
-async def process_job(job_id: uuid.UUID, *, repo: JobRepository, events: EventStore, work_fn) -> ProcessResult:
+async def process_job(
+    job_id: uuid.UUID, *, repo: JobRepository, events: EventStore, work_fn, cache=None
+) -> ProcessResult:
     """Handle exactly one delivered job id. Safe to call more than once."""
     job = await repo.get(job_id)
     if job is None:
@@ -51,7 +54,9 @@ async def process_job(job_id: uuid.UUID, *, repo: JobRepository, events: EventSt
         # before we picked it up. Nothing to do — this is the idempotent guard.
         return ProcessResult.SKIPPED
 
-    service = JobService(repo, events)
+    # Pass the cache so the worker's own transitions invalidate it too — else an
+    # API read could serve a stale status after the worker advances the job.
+    service = JobService(repo, events, cache=cache)
 
     # Only PENDING jobs get "started". A RUNNING job here means a redelivery
     # after a crash mid-run, so we skip the (illegal) RUNNING->RUNNING move and
@@ -88,21 +93,58 @@ async def process_job(job_id: uuid.UUID, *, repo: JobRepository, events: EventSt
 # `process_job` don't need the redis package installed.
 # ---------------------------------------------------------------------------
 
-def _make_work_fn(repo: JobRepository):
-    """A placeholder unit of work with COOPERATIVE cancellation.
+def _make_agent_work_fn(repo: JobRepository, docs, bus, llm, settings):
+    """Stage 3: run the real Claude agent loop as the job's unit of work.
 
-    It "works" in a few steps, re-reading the job between steps; if the job has
-    been cancelled it returns early. Cooperative cancellation = the worker
-    periodically checks whether it's been asked to stop, rather than being
-    force-killed mid-write.
+    Reads the task from the job's payload (Mongo), runs plan->tool->observe under
+    a token budget, streams each step to the StreamBus (for SSE), and stores the
+    final answer + full trajectory back to Mongo. Cancellation is cooperative:
+    the loop re-checks the job's status between steps via `should_cancel`.
+
+    On a non-successful stop (budget/max_steps/refusal/cancelled) it raises, so
+    `process_job` marks the job FAILED with the reason.
     """
+    from app.agent.loop import run_agent
+    from app.agent.tools import DEFAULT_TOOLS
 
     async def work_fn(job) -> None:
-        for _ in range(3):
+        doc = await docs.get(job.id)
+        payload = doc.payload if doc else {}
+        # accept {"prompt": "..."} or {"task": "..."}; fall back to the raw payload
+        task = payload.get("prompt") or payload.get("task") or json.dumps(payload)
+
+        async def on_step(step: dict) -> None:
+            await bus.publish(job.id, step)          # live-stream to any SSE client
+
+        async def should_cancel() -> bool:
             current = await repo.get(job.id)
-            if current is None or current.is_terminal:
-                return  # cancelled/gone -> stop; process_job won't complete it
-            await asyncio.sleep(0.3)  # pretend to do something useful
+            return current is None or current.is_terminal
+
+        result = await run_agent(
+            task,
+            llm=llm,
+            tools=DEFAULT_TOOLS,
+            on_step=on_step,
+            should_cancel=should_cancel,
+            token_budget=settings.agent_token_budget,
+            max_steps=settings.agent_max_steps,
+            max_tokens=settings.agent_max_tokens,
+        )
+
+        # Persist the trajectory + answer (the record lives in Mongo).
+        await docs.set_result(
+            job.id,
+            {
+                "answer": result.answer,
+                "trajectory": result.trajectory,
+                "usage": result.usage,
+                "stopped": result.stopped,
+            },
+        )
+        await bus.publish(job.id, {"type": "end", "stopped": result.stopped})
+
+        if result.stopped != "done":
+            raise RuntimeError(f"agent stopped: {result.stopped}")
 
     return work_fn
 
@@ -111,11 +153,16 @@ async def run_worker() -> None:
     import os
     import socket
 
+    from motor.motor_asyncio import AsyncIOMotorClient
     from redis.asyncio import Redis
 
+    from app.adapters.anthropic.llm import AnthropicLLMClient
+    from app.adapters.mongo.document_store import MongoDocumentStore
     from app.adapters.postgres.event_store import PostgresEventStore
     from app.adapters.postgres.repository import PostgresJobRepository
+    from app.adapters.redis.cache import RedisJobCache
     from app.adapters.redis.queue import RedisJobQueue
+    from app.adapters.redis.stream_bus import RedisStreamBus
     from app.core.config import get_settings
     from app.core.db import create_all, get_sessionmaker
 
@@ -126,6 +173,20 @@ async def run_worker() -> None:
     consumer_name = f"{socket.gethostname()}-{os.getpid()}"
     queue = RedisJobQueue(redis, consumer_name)
     await queue.ensure_group()
+
+    # Stage 2 stores: Mongo for the job document, Redis for the hot-state cache.
+    mongo = AsyncIOMotorClient(settings.mongo_url)
+    docs = MongoDocumentStore(mongo, settings.mongo_db)
+    cache = RedisJobCache(redis)
+
+    # Stage 3: the agent's model (provider-switchable via LLM_PROVIDER) + the
+    # live step stream bus. Same port, different adapter — the loop doesn't care.
+    if settings.llm_provider == "groq":
+        from app.adapters.groq.llm import GroqLLMClient
+        llm = GroqLLMClient(settings.groq_model, settings.groq_api_key or None)
+    else:
+        llm = AnthropicLLMClient(settings.agent_model, settings.anthropic_api_key or None)
+    bus = RedisStreamBus(redis)
 
     sessionmaker = get_sessionmaker()
     print(f"[worker] started as '{consumer_name}', waiting for jobs...")
@@ -142,7 +203,11 @@ async def run_worker() -> None:
                 events = PostgresEventStore(session)
                 try:
                     result = await process_job(
-                        msg.job_id, repo=repo, events=events, work_fn=_make_work_fn(repo)
+                        msg.job_id,
+                        repo=repo,
+                        events=events,
+                        work_fn=_make_agent_work_fn(repo, docs, bus, llm, settings),
+                        cache=cache,
                     )
                     await session.commit()
                 except Exception as exc:  # noqa: BLE001

@@ -16,16 +16,28 @@ Endpoints:
 
 from __future__ import annotations
 
+import json
 import uuid
 
 from fastapi import APIRouter, Depends, Header, Query, Response, status
+from fastapi.responses import StreamingResponse
 
-from app.api.deps import get_event_store, get_job_repository, get_job_service
-from app.api.schemas import JobCreate, JobEventOut, JobOut
+from app.api.deps import (
+    get_document_store,
+    get_event_store,
+    get_job_cache,
+    get_job_repository,
+    get_job_service,
+    get_stream_bus,
+)
+from app.api.schemas import JobCreate, JobDocumentOut, JobEventOut, JobOut
 from app.application.job_service import JobService
 from app.domain.exceptions import JobNotFound
+from app.ports.cache import JobCache
+from app.ports.document_store import JobDocumentStore
 from app.ports.event_store import EventStore
 from app.ports.job_repository import JobRepository
+from app.ports.stream_bus import StreamBus
 
 router = APIRouter(prefix="/v1/jobs", tags=["jobs"])
 
@@ -50,11 +62,36 @@ async def submit_job(
 async def get_job(
     job_id: uuid.UUID,
     repo: JobRepository = Depends(get_job_repository),
+    cache: JobCache = Depends(get_job_cache),
 ) -> JobOut:
+    # CACHE-ASIDE: try the fast copy first; on a miss, read Postgres and
+    # populate the cache so the next poll is cheap. Invalidation happens on
+    # writes (see JobService), so the cache never lies for long.
+    cached = await cache.get(job_id)
+    if cached is not None:
+        return JobOut.from_entity(cached)
+
     job = await repo.get(job_id)
     if job is None:
         raise JobNotFound(str(job_id))
+    await cache.set(job)
     return JobOut.from_entity(job)
+
+
+@router.get("/{job_id}/document", response_model=JobDocumentOut)
+async def get_job_document(
+    job_id: uuid.UUID,
+    repo: JobRepository = Depends(get_job_repository),
+    docs: JobDocumentStore = Depends(get_document_store),
+) -> JobDocumentOut:
+    # The big document (payload + result) lives in MongoDB, separate from the
+    # metadata in Postgres. 404 if there's no such job.
+    if await repo.get(job_id) is None:
+        raise JobNotFound(str(job_id))
+    doc = await docs.get(job_id)
+    if doc is None:
+        raise JobNotFound(str(job_id))
+    return JobDocumentOut.from_entity(doc)
 
 
 @router.get("", response_model=list[JobOut])
@@ -89,3 +126,23 @@ async def cancel_job(
     # is already terminal). Cancelling a PENDING or RUNNING job is allowed.
     job = await service.cancel(job_id)
     return JobOut.from_entity(job)
+
+
+@router.get("/{job_id}/stream")
+async def stream_job(
+    job_id: uuid.UUID,
+    repo: JobRepository = Depends(get_job_repository),
+    bus: StreamBus = Depends(get_stream_bus),
+) -> StreamingResponse:
+    # Server-Sent Events: the worker publishes each agent step to the bus; we
+    # forward them to the client as `data: {json}\n\n` frames until an `end`
+    # event. (Live-only: steps emitted before the client connects aren't
+    # replayed — a production version would replay the Mongo trajectory first.)
+    if await repo.get(job_id) is None:
+        raise JobNotFound(str(job_id))
+
+    async def event_stream():
+        async for event in bus.subscribe(job_id):
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
