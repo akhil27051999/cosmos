@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import DateTime, Integer, String, UniqueConstraint
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -32,7 +32,7 @@ class JobModel(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
-    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # payload moved to MongoDB in Stage 2 — this table is metadata-only now.
     idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

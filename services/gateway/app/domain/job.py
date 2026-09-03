@@ -64,7 +64,9 @@ class Job:
     is somebody else's job (see `ports/job_repository.py`).
     """
 
-    payload: dict                              # what the caller asked us to do
+    # NB: the job's `payload` used to live here (Stage 1). In Stage 2 it moved
+    # to MongoDB (see domain/document.py) because it's large and schema-varying;
+    # the Job entity now holds only small, transactional METADATA.
     id: uuid.UUID = field(default_factory=uuid.uuid4)
     status: JobStatus = JobStatus.PENDING
     # The idempotency key ties a job to the client's "please do this exactly

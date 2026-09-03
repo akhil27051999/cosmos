@@ -14,6 +14,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.domain.document import JobDocument
 from app.domain.events import JobEvent, JobEventType
 from app.domain.job import Job, JobStatus
 
@@ -38,6 +39,22 @@ class JobEventOut(BaseModel):
     @classmethod
     def from_entity(cls, event: JobEvent) -> "JobEventOut":
         return cls.model_validate(event)
+
+
+class JobDocumentOut(BaseModel):
+    """A job's big document from MongoDB (GET /v1/jobs/{id}/document)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    job_id: uuid.UUID
+    payload: dict
+    result: dict | None
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_entity(cls, doc: JobDocument) -> "JobDocumentOut":
+        return cls.model_validate(doc)
 
 
 class JobOut(BaseModel):

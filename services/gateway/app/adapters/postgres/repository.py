@@ -25,11 +25,10 @@ from app.domain.job import Job, JobStatus
 
 
 def _to_entity(row: JobModel) -> Job:
-    """DB row -> domain object."""
+    """DB row -> domain object. (payload lives in Mongo now, not here.)"""
     return Job(
         id=row.id,
         status=JobStatus(row.status),
-        payload=row.payload,
         idempotency_key=row.idempotency_key,
         version=row.version,
         created_at=row.created_at,
@@ -42,7 +41,6 @@ def _to_model(job: Job) -> JobModel:
     return JobModel(
         id=job.id,
         status=job.status.value,
-        payload=job.payload,
         idempotency_key=job.idempotency_key,
         version=job.version,
         created_at=job.created_at,
@@ -96,7 +94,6 @@ class PostgresJobRepository:
             .where(JobModel.id == job.id, JobModel.version == expected_version)
             .values(
                 status=job.status.value,
-                payload=job.payload,
                 version=job.version,          # already bumped by the domain
                 updated_at=job.updated_at,
             )
