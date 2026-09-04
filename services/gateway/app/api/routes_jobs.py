@@ -29,6 +29,7 @@ from app.api.deps import (
     get_job_repository,
     get_job_service,
     get_stream_bus,
+    get_submit_rate_limiter,
 )
 from app.api.schemas import JobCreate, JobDocumentOut, JobEventOut, JobOut
 from app.application.job_service import JobService
@@ -38,6 +39,8 @@ from app.ports.document_store import JobDocumentStore
 from app.ports.event_store import EventStore
 from app.ports.job_repository import JobRepository
 from app.ports.stream_bus import StreamBus
+from app.resilience.errors import RateLimited
+from app.resilience.rate_limiter import RateLimiter
 
 router = APIRouter(prefix="/v1/jobs", tags=["jobs"])
 
@@ -48,7 +51,14 @@ async def submit_job(
     response: Response,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     service: JobService = Depends(get_job_service),
+    limiter: RateLimiter = Depends(get_submit_rate_limiter),
 ) -> JobOut:
+    # LOAD SHEDDING (admission control): if we're over the allowed submission
+    # rate, reject fast with 429 instead of accepting work we can't keep up with.
+    # Shedding early protects the whole system from collapsing under overload.
+    if not await limiter.try_acquire():
+        raise RateLimited(retry_after=1)
+
     # The service creates + enqueues the job (or replays an existing one for a
     # repeated idempotency key). All the lifecycle logic lives there, not here.
     job, created = await service.submit(body.payload, idempotency_key)

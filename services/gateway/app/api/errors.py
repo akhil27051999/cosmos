@@ -24,6 +24,7 @@ from app.domain.exceptions import (
     JobNotFound,
     VersionConflict,
 )
+from app.resilience.errors import RateLimited
 
 
 def _envelope(status_code: int, code: str, message: str) -> JSONResponse:
@@ -54,6 +55,14 @@ def install_error_handlers(app: FastAPI) -> None:
         # error we haven't explicitly mapped yet.
         status_code, code = _DOMAIN_MAP.get(type(exc), (400, "domain_error"))
         return _envelope(status_code, code, str(exc))
+
+    @app.exception_handler(RateLimited)
+    async def _handle_rate_limited(_: Request, exc: RateLimited) -> JSONResponse:
+        # Load shed: 429 Too Many Requests + a Retry-After hint so well-behaved
+        # clients back off instead of retrying immediately.
+        resp = _envelope(429, "rate_limited", "too many requests — try again shortly")
+        resp.headers["Retry-After"] = str(exc.retry_after)
+        return resp
 
     @app.exception_handler(RequestValidationError)
     async def _handle_validation(_: Request, exc: RequestValidationError) -> JSONResponse:

@@ -25,6 +25,7 @@ from app.ports.document_store import JobDocumentStore
 from app.ports.event_store import EventStore
 from app.ports.job_queue import JobQueue
 from app.ports.job_repository import JobRepository
+from app.resilience.rate_limiter import RateLimiter
 from app.ports.stream_bus import StreamBus
 
 
@@ -100,6 +101,27 @@ def get_job_cache() -> JobCache:
     from app.adapters.redis.cache import RedisJobCache  # lazy import
 
     return RedisJobCache(_get_redis())
+
+
+@lru_cache
+def _get_submit_limiter():
+    """One shared, Redis-backed token bucket for admission control on submit.
+
+    Redis-backed so the limit is enforced across ALL gateway replicas, not
+    per-process. Created once per process.
+    """
+    from app.adapters.redis.rate_limiter import RedisTokenBucket  # lazy import
+
+    from app.core.config import get_settings
+
+    s = get_settings()
+    return RedisTokenBucket(
+        _get_redis(), "ratelimit:submit", s.submit_burst, s.submit_rate_per_sec
+    )
+
+
+def get_submit_rate_limiter() -> RateLimiter:
+    return _get_submit_limiter()
 
 
 def get_stream_bus() -> StreamBus:
