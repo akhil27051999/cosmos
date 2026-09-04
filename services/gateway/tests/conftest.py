@@ -31,9 +31,11 @@ from app.api.deps import (
     get_job_repository,
     get_job_service,
     get_stream_bus,
+    get_submit_rate_limiter,
 )
 from app.application.job_service import JobService
 from app.main import create_app
+from app.resilience.rate_limiter import TokenBucket
 
 
 @pytest_asyncio.fixture
@@ -47,6 +49,14 @@ async def env():
     cache = InMemoryJobCache()
     bus = InMemoryStreamBus()
     service = JobService(repo, events, queue, docs, cache)
+    # Permissive by default so normal tests aren't shed; a test can reassign
+    # `env.limiter` to a tiny bucket to exercise load-shedding.
+    limiter = TokenBucket(capacity=1_000_000, refill_per_sec=1_000_000)
+
+    ns = SimpleNamespace(
+        client=None, repo=repo, events=events, queue=queue, docs=docs,
+        cache=cache, bus=bus, service=service, limiter=limiter,
+    )
 
     # Point every provider at the shared in-memory instances.
     app.dependency_overrides[get_job_repository] = lambda: repo
@@ -56,16 +66,10 @@ async def env():
     app.dependency_overrides[get_job_cache] = lambda: cache
     app.dependency_overrides[get_stream_bus] = lambda: bus
     app.dependency_overrides[get_job_service] = lambda: service
+    # Read the limiter off the namespace each call, so a test can swap it.
+    app.dependency_overrides[get_submit_rate_limiter] = lambda: ns.limiter
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        yield SimpleNamespace(
-            client=client,
-            repo=repo,
-            events=events,
-            queue=queue,
-            docs=docs,
-            cache=cache,
-            bus=bus,
-            service=service,
-        )
+        ns.client = client
+        yield ns

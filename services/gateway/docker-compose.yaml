@@ -51,6 +51,9 @@ services:
       MONGO_URL: mongodb://mongo:27017
       MONGO_DB: cosmos
       APP_ENV: local
+      # Stage 4: edge load-shedding (admission control) on POST /v1/jobs.
+      SUBMIT_RATE_PER_SEC: ${SUBMIT_RATE_PER_SEC:-20}
+      SUBMIT_BURST: ${SUBMIT_BURST:-40}
     ports:
       - "8000:8000"
     depends_on:
@@ -79,6 +82,13 @@ services:
       AGENT_MODEL: ${AGENT_MODEL:-claude-opus-5}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+      # Stage 4: resilience around the provider call (all optional; sane defaults).
+      LLM_FALLBACK_PROVIDER: ${LLM_FALLBACK_PROVIDER:-}
+      LLM_TIMEOUT_S: ${LLM_TIMEOUT_S:-60}
+      RETRY_MAX_ATTEMPTS: ${RETRY_MAX_ATTEMPTS:-3}
+      RETRY_BASE_DELAY: ${RETRY_BASE_DELAY:-0.5}
+      BREAKER_FAILURE_THRESHOLD: ${BREAKER_FAILURE_THRESHOLD:-5}
+      BREAKER_RESET_S: ${BREAKER_RESET_S:-30}
     depends_on:
       postgres:
         condition: service_healthy
