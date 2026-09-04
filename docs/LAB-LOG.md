@@ -253,10 +253,11 @@ cd ~/Desktop/cosmos-platform/services/gateway && docker compose up -d && docker 
 docker compose down
 ```
 
-## 7. What exists now (created across Stages 0–3)
+## 7. What exists now (created across Stages 0–4)
 - **Services:** `gateway` (FastAPI API) + `worker` (queue consumer running the agent) — one codebase, two processes.
-- **Stores:** Postgres (jobs + job_events), MongoDB (job_documents + trajectory), Redis (job queue + cache + SSE pub/sub).
+- **Stores:** Postgres (jobs + job_events), MongoDB (job_documents + trajectory), Redis (job queue + cache + SSE pub/sub + rate-limit bucket).
 - **Agent:** Claude/Groq agent loop (tool use + token budget), LLM behind a port, provider-swappable via `LLM_PROVIDER`.
-- **Endpoints:** `POST /v1/jobs`, `GET /v1/jobs`, `GET /v1/jobs/{id}`, `GET /v1/jobs/{id}/document`, `GET /v1/jobs/{id}/events`, `GET /v1/jobs/{id}/stream` (SSE), `POST /v1/jobs/{id}/cancel`, `GET /healthz`, `GET /readyz`.
-- **Tests:** 29 passing (API, worker, documents, cache, agent loop, tools, streaming, Groq translation).
+- **Resilience (Stage 4):** the provider call is wrapped in timeout → retry(backoff+jitter) → circuit breaker → fallback; `POST /v1/jobs` sheds excess load with **429** via a distributed token bucket.
+- **Endpoints:** `POST /v1/jobs` (202, or 429 when shed), `GET /v1/jobs`, `GET /v1/jobs/{id}`, `GET /v1/jobs/{id}/document`, `GET /v1/jobs/{id}/events`, `GET /v1/jobs/{id}/stream` (SSE), `POST /v1/jobs/{id}/cancel`, `GET /healthz`, `GET /readyz`.
+- **Tests:** 40 passing (API, worker, documents, cache, agent, tools, streaming, Groq, circuit breaker, retry, token bucket, resilient-LLM, load-shed).
 - **Docs:** this file + `ENGINEERING-NOTES.md` + `STAGES.md`.

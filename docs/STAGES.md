@@ -355,8 +355,65 @@ curl -N localhost:8000/v1/jobs/$ID/stream
 
 ---
 
-## Stage 4 — resilience ⬜ (next)
+## Stage 4 — resilience ✅
 
-Will wrap the provider calls with a rate limiter, circuit breaker, retries
-(backoff + jitter), a fallback chain, and load shedding. Steps appended when it
-lands.
+**What it adds:** the provider call (the flaky, external part) is now wrapped in
+resilience, and the gateway sheds excess load.
+
+- **`ResilientLLMClient`** (`app/adapters/resilient/llm.py`) — a decorator over the `LLMClient` port that adds, per call: **timeout → retry (backoff + full jitter) → circuit breaker → fallback provider**. The agent loop is unchanged.
+- **Resilience primitives** (`app/resilience/`): `RetryPolicy`/`run_with_retry`, `CircuitBreaker`, `TokenBucket` — all pure and unit-tested.
+- **Distributed rate limit + load-shedding**: a Redis Lua token bucket (`app/adapters/redis/rate_limiter.py`) guards `POST /v1/jobs`; over the limit → **429** with `Retry-After`.
+
+**Config knobs (env):** `LLM_TIMEOUT_S`, `RETRY_MAX_ATTEMPTS`, `RETRY_BASE_DELAY`, `BREAKER_FAILURE_THRESHOLD`, `BREAKER_RESET_S`, `LLM_FALLBACK_PROVIDER` (`anthropic`|`groq`), `SUBMIT_RATE_PER_SEC`, `SUBMIT_BURST`.
+
+### Test steps
+
+**A. Automated (no infra — seconds)**
+```bash
+cd services/gateway && source .venv/bin/activate && pytest -q
+```
+Expect **40 passed** (adds circuit-breaker, retry, token-bucket, resilient-LLM, and load-shed tests). All use fakes/injected clocks — no provider, no Redis.
+
+**B. See a fallback provider in action (Docker)**
+Set a primary that will fail and a fallback that works, so a provider outage is absorbed:
+```bash
+export LLM_PROVIDER=groq            GROQ_API_KEY=gsk_...   GROQ_MODEL=openai/gpt-oss-20b
+export LLM_FALLBACK_PROVIDER=anthropic  ANTHROPIC_API_KEY=sk-ant-...   # or swap which is primary
+cd services/gateway && docker compose up -d
+```
+Submit a job; if the primary errors (e.g. a bad model id), the worker retries, then falls back — the job still `succeeds`. The failure/fallback shows in `docker compose logs -f worker`.
+
+**C. Trigger load-shedding (429)** — set a tiny submit limit and hammer it:
+```bash
+export SUBMIT_RATE_PER_SEC=1 SUBMIT_BURST=3
+docker compose up -d
+# fire 6 quick submits; the first ~3 get 202, the rest 429:
+for i in $(seq 1 6); do
+  curl -s -o /dev/null -w "%{http_code}\n" -XPOST localhost:8000/v1/jobs \
+    -H 'content-type: application/json' -d '{"payload":{"prompt":"hi"}}'
+done
+# expect: 202 202 202 429 429 429   (then reset with SUBMIT_BURST=40 and up -d)
+```
+
+**What to verify (learning checkpoints):**
+- A *transient* failure (timeout/429/5xx) is **retried**; a *permanent* one (400/validation) fails immediately.
+- After repeated failures the **breaker opens** and calls fast-fail (worker logs) until the cooldown.
+- With `LLM_FALLBACK_PROVIDER` set, a primary outage still yields a `succeeded` job via the fallback.
+- Over-rate submits return **429 + `Retry-After`**, and the body uses the standard error envelope (`code: "rate_limited"`).
+
+### Troubleshooting
+
+| Symptom | Cause & fix |
+|---|---|
+| Every submit returns 429 immediately | `SUBMIT_BURST`/`SUBMIT_RATE_PER_SEC` too low, or the Redis bucket key is stale. Raise them and `docker compose up -d`; or `docker compose exec redis redis-cli DEL ratelimit:submit`. |
+| Jobs still fail instead of falling back | `LLM_FALLBACK_PROVIDER` unset, or the fallback's key/model is also invalid. Check both providers' keys/models; watch `docker compose logs worker`. |
+| A job hangs then fails after ~60s | The provider stalled and hit `LLM_TIMEOUT_S`; it's retried per `RETRY_MAX_ATTEMPTS`. Lower the timeout for faster failover, or raise attempts for flakier providers. |
+| Breaker seems stuck open | It reopens for `BREAKER_RESET_S` after each failed probe. If the provider is genuinely down, that's correct — fix the provider or switch `LLM_PROVIDER`. |
+| Load-shed rejects legit traffic under multiple gateway replicas | Good — the limit is *shared* via Redis (that's the point). Size `SUBMIT_RATE_PER_SEC` for total capacity, not per replica. |
+
+---
+
+## Stage 5 — event-driven backbone ⬜ (next)
+
+Will introduce Kafka/Redpanda as the backbone with CQRS read models, the
+transactional outbox, Saga, and CDC. Steps appended when it lands.

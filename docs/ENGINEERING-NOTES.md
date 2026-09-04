@@ -18,6 +18,7 @@
 5. **Stage 1** — the async core (block-by-block)
 5B. **Stage 2** — polyglot persistence (block-by-block)
 5C. **Stage 3** — the agent layer (block-by-block)
+5D. **Stage 4** — resilience (block-by-block)
 6. Cross-cutting design decisions & trade-offs
 7. Interview Q&A — what / why / how
 8. Known gaps and what later stages fix
@@ -583,6 +584,69 @@ to exist and the deepest interview area (the agent/LLM layer).
 
 ---
 
+## 5D. Stage 4 — resilience (block-by-block)
+
+**Idea:** the provider call is the flaky part (network, rate limits, outages).
+Wrap it so transient failures are absorbed and a dead dependency can't take the
+whole system down — and shed load at the edge before it overwhelms us.
+**Motive:** this is one of the three "go-to-90%" interview anchors; every
+pattern here is standard senior-SRE vocabulary.
+
+**Key move:** resilience is a **decorator over the `LLMClient` port**, so the
+agent loop is untouched — same trick as every other stage.
+
+### 5D.1 `app/resilience/retry.py` — retry with backoff + jitter
+- **`RetryPolicy`** (max_attempts, base_delay, max_delay) + **`run_with_retry`**.
+- **Exponential backoff** (`base·2^(n-1)`, capped) so we don't hammer a
+  struggling dependency; **full jitter** (`uniform(0, backoff)`) so many clients
+  don't retry in lockstep (thundering herd). Only retries what `is_retryable`
+  approves — a permanent 400 fails at once. `sleep`/`rand` are injected so tests
+  are instant and deterministic.
+
+### 5D.2 `app/resilience/circuit_breaker.py` — fail fast when a dep is down
+- **`CircuitBreaker`** with CLOSED / OPEN / HALF_OPEN. Trips to OPEN after
+  `failure_threshold` consecutive failures; OPEN rejects instantly
+  (`CircuitOpenError`) for `reset_timeout`; then HALF_OPEN lets **one** probe
+  through — success closes it, failure reopens. *Why:* retrying a genuinely-down
+  provider just piles on load and makes every caller wait; the breaker frees them
+  immediately and gives the dep room to recover. Injectable clock for tests.
+
+### 5D.3 `app/resilience/rate_limiter.py` — token bucket
+- **`TokenBucket`** (capacity + refill/sec): steady average rate with room for
+  short bursts — the shape real traffic has. Used for admission control (shed) at
+  the edge, and reusable to throttle provider calls. In-memory here; Redis for
+  the distributed version.
+
+### 5D.4 `app/resilience/errors.py` — the retry classifier
+- `is_retryable(exc)` decides transient vs permanent **generically** (by
+  exception type, class-name hint, or HTTP status) so it works across provider
+  SDKs without importing them. `CircuitOpenError` and `RateLimited` live here too.
+
+### 5D.5 `app/adapters/resilient/llm.py` — `ResilientLLMClient` (the centerpiece)
+- Implements `LLMClient`, wraps a **primary** and optional **fallback** client.
+  Per call to a provider: **circuit breaker → retry(backoff+jitter) → timeout**
+  (`asyncio.wait_for`). If the primary is exhausted or its breaker is open, it
+  tries the fallback — **each provider has its own breaker**, so one being down
+  doesn't hide the other's health. The agent loop calls `create_turn` and is
+  none the wiser.
+
+### 5D.6 `app/adapters/redis/rate_limiter.py` — distributed limiter
+- **`RedisTokenBucket`** implements the bucket in Redis via a **Lua script**, run
+  atomically. *Why atomic:* two gateway replicas must not both consume "the last
+  token" (a race); one Lua check-and-decrement is indivisible and shared by all
+  replicas, so the limit is global, not per-process.
+
+### 5D.7 Wiring — worker + gateway
+- **Worker** (`worker.py`) builds the provider(s) and wraps them in
+  `ResilientLLMClient` (retry/timeout/breaker from config, optional
+  `LLM_FALLBACK_PROVIDER`). One line; the agent loop unchanged.
+- **Gateway** (`routes_jobs.py` + `deps.py`): `submit_job` calls the shared
+  `RedisTokenBucket`; over the limit it raises `RateLimited`, which
+  `api/errors.py` maps to **429 + `Retry-After`** — **load shedding** as
+  admission control.
+
+---
+
 ## 6. Cross-cutting design decisions & trade-offs
 
 | Decision | Why | Trade-off / later fix |
@@ -600,6 +664,11 @@ to exist and the deepest interview area (the agent/LLM layer).
 | Polyglot: payload/result in Mongo | document-shaped, schema-flexible, no joins | multi-store writes aren't atomic → outbox/CDC (Stage 5) |
 | Redis cache-aside + invalidate-on-write | fast reads, absorb poll storms | cache can briefly lag; TTL is the backstop |
 | Cache also invalidated by the worker | reads never serve a stale status | worker must know the cache (threaded in) |
+| Resilience as a decorator over the LLM port | agent loop unchanged; composable | one more layer to reason about |
+| Retry + backoff + **jitter** | absorbs transient blips without stampedes | adds latency on failures; needs a retryable/permanent split |
+| Circuit breaker per provider | fail fast when a dep is down; independent health | a flapping dep can oscillate; tune threshold/cooldown |
+| Fallback provider chain | survive one provider's outage | fallback may cost/behave differently; not always desirable |
+| Distributed (Redis+Lua) rate limit | one global limit across replicas | a Redis round-trip per request; Redis is now on the submit path |
 | LLM behind a port + scripted fake | tests run with no key/network/cost | one more abstraction layer |
 | Agent guardrails (token budget, max steps) | bound cost + prevent infinite loops | may stop before a hard task finishes |
 | SSE via Redis pub/sub | live progress across processes | live-only (no replay) until Stage 5-style history stream |
@@ -727,6 +796,38 @@ Stage 4 resilience. Naming these unprompted signals seniority.
 
 ---
 
+**Q: Retries can make an outage worse — how do you retry safely? (Stage 4)**
+Three ways. (1) Only retry *transient* failures (timeouts, 429, 5xx); a 400 fails
+immediately — no point retrying a bad request. (2) **Exponential backoff** so I
+wait longer each time instead of hammering a struggling dependency. (3) **Full
+jitter** so many workers don't retry in lockstep and create a thundering herd.
+
+**Q: What does the circuit breaker add on top of retries?**
+Retries handle a blip; the breaker handles a *sustained* outage. After N
+consecutive failures it OPENs and rejects calls instantly for a cooldown —
+callers fail fast instead of each waiting through the full timeout+retries, and
+the dead dependency gets breathing room. After the cooldown it half-opens, lets
+one probe through, and closes on success. Each provider gets its own breaker.
+
+**Q: How does a provider outage not fail the job?**
+`ResilientLLMClient` wraps a primary and a fallback. If the primary is exhausted
+or its breaker is open, it transparently calls the fallback (its own breaker).
+Set `LLM_FALLBACK_PROVIDER` and, say, a Groq outage falls back to Anthropic —
+the agent loop never knows.
+
+**Q: Where and how do you shed load?**
+At the edge — `POST /v1/jobs` consults a token-bucket rate limiter and returns
+**429 + Retry-After** when over the limit (admission control). Rejecting early is
+far cheaper than accepting work that backs up and collapses the system. The
+bucket lives in Redis (atomic Lua), so the limit is **global across gateway
+replicas**, not N× too high.
+
+**Q: Why is the rate limiter in Redis and not in-process?**
+With multiple gateway replicas, per-process buckets would each allow the full
+rate, so the real limit would be replicas × configured. A shared Redis bucket,
+decremented atomically by a Lua script, enforces one global limit and avoids the
+race where two replicas both consume the last token.
+
 ## 8. Known gaps and what later stages fix
 - **MongoDB trajectories + Redis hot state** (polyglot) → **Stage 2**. ✅ done
 - **Multi-store consistency** (Mongo+Postgres+Redis not atomic) → transactional **outbox + CDC**, **Stage 5**.
@@ -735,8 +836,9 @@ Stage 4 resilience. Naming these unprompted signals seniority.
 - **Real work** (Claude agent loop + tool use) replacing the echo placeholder → **Stage 3**. ✅ done
 - **RAG** (embeddings + vector retrieval) added to the agent → later in Stage 3/expansion.
 - **SSE trajectory replay** (not just live) → Stage 5-style history stream.
-- **Retries/backoff/circuit breaker** around the model/provider calls → **Stage 4**.
-- **Kafka backbone, CQRS read models, CDC** → **Stage 5**.
+- **Retries/backoff/circuit breaker/fallback + rate-limit/load-shed** → **Stage 4**. ✅ done
+- **Provider-side call throttling** (reuse the token bucket to respect provider limits) — small follow-on to Stage 4.
+- **Kafka backbone, CQRS read models, CDC + transactional outbox** → **Stage 5**.
 
 ## 9. Glossary
 - **Accept-fast / 202+id** — return an id immediately, process later.
