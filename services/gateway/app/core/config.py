@@ -49,6 +49,18 @@ class Settings(BaseSettings):
     agent_max_steps: int = 8                    # loop iterations guardrail
     agent_token_budget: int = 20_000            # total-token guardrail across the loop
 
+    # Stage 4 — resilience around the provider call.
+    llm_timeout_s: float = 60.0                 # cap on a single model call
+    retry_max_attempts: int = 3                 # total tries per provider
+    retry_base_delay: float = 0.5               # backoff base (seconds)
+    breaker_failure_threshold: int = 5          # consecutive failures -> OPEN
+    breaker_reset_s: float = 30.0               # OPEN cooldown before a probe
+    llm_fallback_provider: str = ""             # ""|"anthropic"|"groq" — try this if primary fails
+
+    # Stage 4 — edge load-shedding (admission control on POST /v1/jobs).
+    submit_rate_per_sec: float = 20.0           # sustained submissions/sec
+    submit_burst: int = 40                      # bucket capacity (short bursts)
+
     log_level: str = "INFO"
 
 

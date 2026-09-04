@@ -179,13 +179,31 @@ async def run_worker() -> None:
     docs = MongoDocumentStore(mongo, settings.mongo_db)
     cache = RedisJobCache(redis)
 
-    # Stage 3: the agent's model (provider-switchable via LLM_PROVIDER) + the
-    # live step stream bus. Same port, different adapter — the loop doesn't care.
-    if settings.llm_provider == "groq":
-        from app.adapters.groq.llm import GroqLLMClient
-        llm = GroqLLMClient(settings.groq_model, settings.groq_api_key or None)
-    else:
-        llm = AnthropicLLMClient(settings.agent_model, settings.anthropic_api_key or None)
+    # Stage 3/4: build the model provider(s), then WRAP them with resilience.
+    # Same LLMClient port throughout — the agent loop can't tell the difference.
+    from app.adapters.resilient.llm import BreakerConfig, ResilientLLMClient
+    from app.resilience.retry import RetryPolicy
+
+    def _build_provider(name: str):
+        if name == "groq":
+            from app.adapters.groq.llm import GroqLLMClient
+            return GroqLLMClient(settings.groq_model, settings.groq_api_key or None)
+        return AnthropicLLMClient(settings.agent_model, settings.anthropic_api_key or None)
+
+    primary = _build_provider(settings.llm_provider)
+    fallback = _build_provider(settings.llm_fallback_provider) if settings.llm_fallback_provider else None
+    llm = ResilientLLMClient(
+        primary,
+        fallback,
+        retry=RetryPolicy(
+            max_attempts=settings.retry_max_attempts, base_delay=settings.retry_base_delay
+        ),
+        timeout_s=settings.llm_timeout_s,
+        breaker=BreakerConfig(
+            failure_threshold=settings.breaker_failure_threshold,
+            reset_timeout=settings.breaker_reset_s,
+        ),
+    )
     bus = RedisStreamBus(redis)
 
     sessionmaker = get_sessionmaker()
