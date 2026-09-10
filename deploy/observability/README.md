@@ -66,8 +66,32 @@ and it appears in **Alertmanager** (:9093). Turn it back off:
 ```bash
 export CHAOS_ENABLED=false CHAOS_FAULT_RATE=0.0 && docker compose up -d gateway
 ```
-(Wire a Slack/webhook receiver in `alertmanager/alertmanager.yml` to test real
-notification delivery.)
+
+### Slack notifications (real delivery)
+
+Alertmanager routes firing alerts to Slack via `slack_configs`. The webhook URL
+is a secret, kept in `alertmanager/slack_api_url` (referenced by `api_url_file`),
+not inlined in the config.
+
+1. Create a Slack **Incoming Webhook**: Slack → Apps → *Incoming Webhooks* → add
+   to a channel → copy the `https://hooks.slack.com/services/...` URL.
+2. Put it in the file (replace the placeholder):
+   ```bash
+   printf 'https://hooks.slack.com/services/XXX/YYY/ZZZ\n' > deploy/observability/alertmanager/slack_api_url
+   # keep your real webhook OUT of git:
+   git update-index --skip-worktree deploy/observability/alertmanager/slack_api_url
+   ```
+3. Restart Alertmanager and fire an alert:
+   ```bash
+   cd deploy/observability && docker compose -f docker-compose.observability.yaml up -d alertmanager
+   # trigger HighErrorRate via chaos (above) -> a message posts to your channel,
+   # and a "RESOLVED" follow-up when you turn chaos off (send_resolved: true).
+   ```
+
+> Until you set a real URL, Alertmanager still starts and shows alerts in its UI —
+> it just gets a 404 posting to the placeholder (harmless, logged). Set the channel
+> in `alertmanager.yml` only if you use a Slack *app* token; incoming webhooks post
+> to the channel the hook was created for.
 
 ## Tear down
 ```bash

@@ -1,12 +1,29 @@
-# Minimal Alertmanager — routes everything to a single receiver. There's no
-# external integration (Slack/PagerDuty) on purpose; for a local test you watch
-# alerts fire in the Alertmanager UI (:9093) and on Prometheus /alerts (:9090).
-# Add a Slack/webhook receiver here to test real notification delivery.
+# Alertmanager — routes firing alerts to Slack.
+#
+# The webhook URL is a SECRET, so it isn't inlined here: `api_url_file` points at
+# /etc/alertmanager/slack_api_url (a file you edit locally). Alerts also always
+# show in the Alertmanager UI (:9093) and Prometheus /alerts, so the stack is
+# useful even before you configure Slack.
+global:
+  resolve_timeout: 5m
+
 route:
-  receiver: default
+  receiver: slack
+  group_by: ["alertname"]
   group_wait: 10s
   group_interval: 30s
   repeat_interval: 1h
 
 receivers:
-  - name: default
+  - name: slack
+    slack_configs:
+      - api_url_file: /etc/alertmanager/slack_api_url
+        channel: "#cosmos-alerts"      # ignored by incoming-webhooks (set by the hook); change for a Slack app
+        send_resolved: true            # also notify when an alert clears
+        title: '{{ .Status | toUpper }}: {{ .CommonAnnotations.summary }}'
+        text: >-
+          {{ range .Alerts -}}
+          *{{ .Labels.severity }}* — {{ .Annotations.summary }}
+          {{ with .Annotations.description }}
+          {{ . }}{{ end }}
+          {{ end }}
