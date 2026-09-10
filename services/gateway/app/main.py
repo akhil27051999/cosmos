@@ -23,12 +23,15 @@ from app.api import (
     routes_experiments,
     routes_health,
     routes_jobs,
+    routes_metrics,
     routes_read,
 )
 from app.api.errors import install_error_handlers
 from app.core.config import get_settings
 from app.core.correlation import CorrelationIdMiddleware
 from app.core.db import create_all
+from app.observability.logging import configure_logging
+from app.observability.middleware import MetricsMiddleware
 
 settings = get_settings()
 
@@ -48,9 +51,15 @@ def create_app() -> FastAPI:
     Building the app inside a function (rather than at import time) makes it
     easy for tests to construct their own instance with overridden dependencies.
     """
+    # Structured logging first, so everything after logs in the chosen format.
+    configure_logging(settings.log_level, settings.log_format)
+
     app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
 
-    # Order matters: middleware wraps every request/response.
+    # Middleware order: the LAST added is OUTERMOST (runs first). We want the
+    # correlation id set BEFORE the metrics middleware logs its access line, so
+    # add metrics first (inner) and correlation last (outer).
+    app.add_middleware(MetricsMiddleware)
     app.add_middleware(CorrelationIdMiddleware)
 
     # Turn domain/validation errors into our consistent JSON envelope.
@@ -58,6 +67,7 @@ def create_app() -> FastAPI:
 
     # Mount the feature routers.
     app.include_router(routes_health.router)
+    app.include_router(routes_metrics.router)
     app.include_router(routes_jobs.router)
     app.include_router(routes_read.router)
     app.include_router(routes_admin.router)

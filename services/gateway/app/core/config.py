@@ -86,7 +86,9 @@ class Settings(BaseSettings):
     worker_grpc_target: str = "worker:50051"    # where the gateway reaches a worker
     worker_grpc_port: int = 50051               # port the worker's gRPC server binds
 
+    # Stage 10 — observability.
     log_level: str = "INFO"
+    log_format: str = "json"                    # "json" (prod/aggregators) | "text" (local)
 
 
 @lru_cache
