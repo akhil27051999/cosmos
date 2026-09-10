@@ -263,12 +263,24 @@ async def run_worker() -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"[worker] gRPC control plane unavailable: {exc!r} (data plane still running)")
 
+    # Stage 12 — graceful shutdown: on SIGTERM/SIGINT (k8s termination) set a
+    # stop event; the loop finishes the CURRENT batch, acks it, then exits — no
+    # job is dropped mid-flight, and unacked messages are safely redelivered.
+    import signal
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:  # e.g. on platforms without signal support
+            pass
+
     print(f"[worker] started as '{consumer_name}', waiting for jobs...")
 
     # On startup, reclaim anything a previous worker left pending (crash recovery).
     backlog = await queue.reclaim_stale(min_idle_ms=30_000)
     messages = backlog
-    while True:
+    while not stop.is_set():
         if not messages:
             messages = await queue.consume(count=10, block_ms=2000)
         for msg in messages:
@@ -299,7 +311,12 @@ async def run_worker() -> None:
             # whole thing at-least-once rather than at-most-once.
             await queue.ack(msg.msg_id)
             print(f"[worker] job {msg.job_id} -> {result.value}")
+            if stop.is_set():
+                break          # stop after finishing (and acking) the current job
         messages = []
+
+    print("[worker] drained; shutting down cleanly")
+    await redis.aclose()
 
 
 def main() -> None:
