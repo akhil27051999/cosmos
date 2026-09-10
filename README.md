@@ -1,5 +1,7 @@
 # Cosmos Platform
 
+[![CI](https://github.com/akhil27051999/cosmos/actions/workflows/ci.yml/badge.svg)](https://github.com/akhil27051999/cosmos/actions/workflows/ci.yml)
+
 A cloud-native, event-driven **LLM job-orchestration platform**, built from
 scratch one runnable stage at a time. Clients submit jobs; the platform accepts
 them instantly, routes them to healthy providers under limits, runs agent
