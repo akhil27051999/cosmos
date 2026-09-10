@@ -43,6 +43,27 @@ services:
     volumes:
       - mongodata:/data/db
 
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --mode
+      - dev-container          # sane single-node defaults for local dev
+      - --smp
+      - "1"
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"          # host tools (rpk) reach it here
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -qE 'Healthy:.+true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
   gateway:
     build: .
     environment:
@@ -54,6 +75,11 @@ services:
       # Stage 4: edge load-shedding (admission control) on POST /v1/jobs.
       SUBMIT_RATE_PER_SEC: ${SUBMIT_RATE_PER_SEC:-20}
       SUBMIT_BURST: ${SUBMIT_BURST:-40}
+      # Stage 6: multi-tenancy. ADMIN_TOKEN guards the admin bootstrap API
+      # (create tenants/keys); blank => the admin API is disabled. Export it
+      # before `up` to enable:  export ADMIN_TOKEN=dev-admin-secret
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      DEFAULT_MONTHLY_QUOTA: ${DEFAULT_MONTHLY_QUOTA:-1000}
     ports:
       - "8000:8000"
     depends_on:
@@ -89,6 +115,8 @@ services:
       RETRY_BASE_DELAY: ${RETRY_BASE_DELAY:-0.5}
       BREAKER_FAILURE_THRESHOLD: ${BREAKER_FAILURE_THRESHOLD:-5}
       BREAKER_RESET_S: ${BREAKER_RESET_S:-30}
+      # Stage 5: event backbone the outbox relay publishes to.
+      REDPANDA_BROKERS: ${REDPANDA_BROKERS:-redpanda:9092}
     depends_on:
       postgres:
         condition: service_healthy
@@ -96,6 +124,10 @@ services:
         condition: service_healthy
       mongo:
         condition: service_healthy
+      redpanda:
+        # started (not healthy) — the relay tolerates the broker being briefly
+        # unavailable and retries, so we don't block worker startup on it.
+        condition: service_started
 
 volumes:
   pgdata:
