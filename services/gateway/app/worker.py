@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from enum import Enum
 
 import uuid
@@ -29,8 +30,32 @@ import uuid
 from app.application.job_service import JobService
 from app.domain.exceptions import DomainError
 from app.domain.job import JobStatus
+from app.domain.worker_status import WorkerStatus
 from app.ports.event_store import EventStore
 from app.ports.job_repository import JobRepository
+
+
+class WorkerMetrics:
+    """Live counters the gRPC control plane reports (Stage 7 part 2).
+
+    Deliberately tiny and framework-free: the worker mutates it as it processes,
+    and `snapshot()` produces the `WorkerStatus` the gRPC servicer returns.
+    """
+
+    def __init__(self, worker_id: str) -> None:
+        self.worker_id = worker_id
+        self._started = time.monotonic()
+        self.in_flight = 0
+        self.processed_total = 0
+
+    def snapshot(self) -> WorkerStatus:
+        return WorkerStatus(
+            worker_id=self.worker_id,
+            uptime_seconds=round(time.monotonic() - self._started, 3),
+            in_flight=self.in_flight,
+            processed_total=self.processed_total,
+            healthy=True,
+        )
 
 
 class ProcessResult(str, Enum):
@@ -227,6 +252,17 @@ async def run_worker() -> None:
     read_model = PostgresReadModel(sessionmaker)
     asyncio.create_task(run_projector(event_bus, read_model))
 
+    # Stage 7 part 2: expose the gRPC control plane (status/health) the gateway
+    # calls. Best-effort: if gRPC/codegen isn't available (e.g. running locally
+    # without stubs), the data plane keeps running regardless.
+    metrics = WorkerMetrics(consumer_name)
+    try:
+        from app.adapters.grpc.worker_control import serve_worker_control
+        await serve_worker_control(settings.worker_grpc_port, metrics.snapshot)
+        print(f"[worker] gRPC control plane on :{settings.worker_grpc_port}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[worker] gRPC control plane unavailable: {exc!r} (data plane still running)")
+
     print(f"[worker] started as '{consumer_name}', waiting for jobs...")
 
     # On startup, reclaim anything a previous worker left pending (crash recovery).
@@ -240,6 +276,7 @@ async def run_worker() -> None:
                 repo = PostgresJobRepository(session)
                 events = PostgresEventStore(session)
                 outbox = PostgresOutbox(session)   # staged events commit with the tx
+                metrics.in_flight += 1             # control-plane counter
                 try:
                     result = await process_job(
                         msg.job_id,
@@ -255,6 +292,9 @@ async def run_worker() -> None:
                     # Do NOT ack -> the message stays pending and gets redelivered.
                     print(f"[worker] error on {msg.job_id}: {exc!r} (will retry)")
                     continue
+                finally:
+                    metrics.in_flight -= 1
+                metrics.processed_total += 1
             # Ack ONLY after a clean commit — that ordering is what makes the
             # whole thing at-least-once rather than at-most-once.
             await queue.ack(msg.msg_id)
