@@ -1,0 +1,39 @@
+// The gateway <-> worker CONTROL-PLANE contract (Stage 7 part 2).
+//
+// This .proto is the *typed contract* between two services: whatever language
+// either side is written in, `protoc` generates matching types + stubs from
+// THIS file, so the wire format can never drift between client and server. That
+// is the whole point of gRPC/protobuf — a schema-first, versioned interface.
+//
+// Note the split of concerns: the DATA plane (submitting/dispatching jobs) stays
+// asynchronous over the Redis queue (accept-fast, decoupled). This gRPC service
+// is the CONTROL plane — synchronous operational queries the gateway (or an
+// operator) makes against a worker: "are you healthy, how many jobs in flight?".
+//
+// Versioned package (`v1`) so a breaking change can ship as `v2` alongside it.
+//
+// Regenerate the Python stubs (done automatically in the Docker build):
+//   python -m grpc_tools.protoc -I proto \
+//     --python_out=app/adapters/grpc/gen \
+//     --grpc_python_out=app/adapters/grpc/gen \
+//     proto/worker_control.proto
+
+syntax = "proto3";
+
+package cosmos.worker.v1;
+
+// Operational control-plane surface exposed by each worker.
+service WorkerControl {
+  // Liveness + basic runtime metrics for one worker process.
+  rpc GetStatus(GetStatusRequest) returns (GetStatusReply);
+}
+
+message GetStatusRequest {}
+
+message GetStatusReply {
+  string worker_id = 1;        // which worker answered (host-pid)
+  double uptime_seconds = 2;   // how long it has been running
+  int32 in_flight = 3;         // jobs currently being processed
+  int64 processed_total = 4;   // jobs completed since start
+  bool healthy = 5;            // the worker's self-assessed health
+}
