@@ -256,14 +256,15 @@ cd ~/Desktop/cosmos-platform/services/gateway && docker compose up -d && docker 
 docker compose down
 ```
 
-## 7. What exists now (created across Stages 0–6)
+## 7. What exists now (created across Stages 0–7 pt1)
 - **Services:** `gateway` (FastAPI API) + `worker` (queue consumer running the agent + the outbox relay + the CQRS projector) — one codebase, multiple processes.
 - **Stores:** Postgres (jobs + job_events + outbox + job_read_model + **tenants + api_keys + usage_ledger**), MongoDB (job_documents + trajectory), Redis (job queue + cache + SSE pub/sub + rate-limit bucket), Redpanda (event backbone: `job-events` topic).
 - **Event backbone (Stage 5 pt1):** every event is staged in an `outbox` table in the same transaction, and a relay drains it to Redpanda at-least-once (transactional outbox).
 - **CQRS read model (Stage 5 pt2):** a projector (`cqrs-projector` consumer group) folds `job-events` into a denormalized, **tenant-scoped** read model, idempotent under at-least-once via version last-writer-wins. Served by `/v1/stats` and `/v1/jobs/{id}/view`.
 - **Multi-tenancy & identity (Stage 6):** every request authenticates with an **API key** (`Authorization: Bearer csk_...`; only the key's hash is stored); every read/write is **scoped to the caller's tenant** (cross-tenant id → 404); a per-tenant **monthly quota** + usage ledger governs submissions (429 `quota_exceeded`); an **admin API** (guarded by `ADMIN_TOKEN`) mints tenants/keys.
+- **OAuth2/OIDC + scopes (Stage 7 pt1):** a caller may instead present an **OIDC JWT** on the same Bearer header (HS256 verified: signature + `exp`/`nbf`/`iss`/`aud`, `alg:none` refused), resolved to the same tenant `Principal`; **scope-based authorization** (`jobs:read`/`jobs:write`) gates each route — 401 (authN) and 403 (authZ) are distinct. Enable with `JWT_HS256_SECRET`.
 - **Agent:** Claude/Groq agent loop (tool use + token budget), LLM behind a port, provider-swappable via `LLM_PROVIDER`.
 - **Resilience (Stage 4):** the provider call is wrapped in timeout → retry(backoff+jitter) → circuit breaker → fallback; `POST /v1/jobs` sheds excess load with **429** via a distributed token bucket.
-- **Endpoints (all `/v1/*` need an API key):** `POST /v1/jobs` (202; 429 when shed *or* over quota), `GET /v1/jobs`, `GET /v1/jobs/{id}`, `GET /v1/jobs/{id}/document`, `GET /v1/jobs/{id}/events`, `GET /v1/jobs/{id}/stream` (SSE), `POST /v1/jobs/{id}/cancel`, `GET /v1/stats`, `GET /v1/jobs/{id}/view`; **admin** (need `X-Admin-Token`): `POST /v1/admin/tenants`, `POST /v1/admin/tenants/{id}/keys`; `GET /healthz`, `GET /readyz` (no auth).
-- **Tests:** 60 passing (+ identity: key crypto, 401/403/revoked, tenant isolation, quota 429, admin bootstrap).
+- **Endpoints (all `/v1/*` need an API key *or* an OIDC JWT, with the right scope):** `POST /v1/jobs` (202; 429 when shed *or* over quota), `GET /v1/jobs`, `GET /v1/jobs/{id}`, `GET /v1/jobs/{id}/document`, `GET /v1/jobs/{id}/events`, `GET /v1/jobs/{id}/stream` (SSE), `POST /v1/jobs/{id}/cancel`, `GET /v1/stats`, `GET /v1/jobs/{id}/view`; **admin** (need `X-Admin-Token`): `POST /v1/admin/tenants`, `POST /v1/admin/tenants/{id}/keys`; `GET /healthz`, `GET /readyz` (no auth).
+- **Tests:** 71 passing (+ JWT: verifier unit tests incl. `alg:none`, JWT submit, scope-gated 403, unknown-tenant 403, expired 401, API-key regression).
 - **Docs:** this file + `ENGINEERING-NOTES.md` + `STAGES.md`.

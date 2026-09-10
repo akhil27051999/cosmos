@@ -596,8 +596,67 @@ second returns **429** `quota_exceeded` with a `Retry-After`.
 
 ---
 
-## Stage 7 — the worker as its own (Go/gRPC) service ⬜ (next)
+## Stage 7 — part 1 (OAuth2/OIDC JWT + scopes) ✅
 
-Will extract the worker into a standalone service with a typed gRPC contract, and
-add OAuth2/OIDC (JWT) as a second principal source alongside API keys. Steps
-appended when it lands.
+**What it adds:** a **second credential scheme** and **authorization**.
+
+- A caller may now present an **OAuth2/OIDC JWT** on the same `Authorization: Bearer` header, as an alternative to a Stage-6 API key. `get_principal` tells them apart (`csk_` prefix ⇒ API key, else JWT) and both resolve to the same `Principal`.
+- `app/auth/jwt.py` — a dependency-free **HS256** verifier: checks the signature (constant-time HMAC), `exp`/`nbf` (with clock-skew leeway), and `iss`/`aud`, and refuses the `alg:none` confusion attack. (Production would verify **RS256 via a JWKS** — a later increment behind the same shape.)
+- **Scope-based authorization** (`app/auth/scopes.py`): the `Principal` carries `scopes`; `require_scope(...)` gates each route — `jobs:write` for submit/cancel, `jobs:read` for the rest. API keys are full-access; JWTs carry whatever their `scope` claim grants. AuthN (401) and authZ (403) are now distinct.
+- Config (`JWT_HS256_SECRET`, `JWT_ISSUER`, `JWT_AUDIENCE`, `JWT_TENANT_CLAIM`, `JWT_SCOPE_CLAIM`): a blank secret ⇒ JWT auth disabled (only API keys accepted).
+
+### Test steps
+
+**A. Automated**
+```bash
+cd services/gateway && source .venv/bin/activate && pytest -q
+```
+Expect **71 passed** (adds 11: JWT verifier unit tests — signature, exp/nbf, iss/aud, `alg:none` — plus HTTP tests for JWT submit, scope-gating 403, unknown-tenant 403, expired 401, and API-key regression).
+
+**B. End-to-end (Docker)** — mint a quick HS256 token and call the API with it.
+```bash
+cd services/gateway
+export ADMIN_TOKEN=dev-admin-secret
+export JWT_HS256_SECRET=dev-jwt-secret          # enables JWT auth
+docker compose up -d --build
+until curl -sf localhost:8000/healthz >/dev/null; do sleep 1; done; echo ready
+
+# Create a tenant (admin) and grab its id:
+TENANT=$(curl -s -XPOST localhost:8000/v1/admin/tenants \
+  -H "X-Admin-Token: $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d '{"name":"Acme"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["tenant_id"])')
+
+# Mint an HS256 JWT for that tenant with read+write scope (pure stdlib, no deps):
+TOKEN=$(python3 -c "
+from app.auth.jwt import encode_hs256
+import time
+print(encode_hs256({'tenant_id':'$TENANT','scope':'jobs:read jobs:write',
+                    'sub':'demo','exp':int(time.time())+3600}, '$JWT_HS256_SECRET'))
+")
+
+# Submit with the JWT -> 202, tenant taken from the claim:
+curl -s -XPOST localhost:8000/v1/jobs -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' -d '{"payload":{"prompt":"hi"}}' | python3 -m json.tool
+```
+
+**Prove scope enforcement:** mint a token with `'scope':'jobs:read'` only — `GET
+/v1/jobs` returns 200, but `POST /v1/jobs` returns **403 `forbidden`** (missing
+`jobs:write`). **Prove expiry:** mint one with `exp` in the past — any call
+returns **401** with `WWW-Authenticate: Bearer`.
+
+### Troubleshooting
+
+| Symptom | Cause & fix |
+|---|---|
+| JWT always `401 invalid token` | Secret mismatch (token signed with a different secret than `JWT_HS256_SECRET`), or expired. Re-mint with the same secret and a future `exp`. |
+| JWT `401 unrecognised credential` | `JWT_HS256_SECRET` is blank in the gateway ⇒ JWT auth disabled. `export JWT_HS256_SECRET=...` then `docker compose up -d` (env-only → no `--build`). |
+| JWT authenticates but every write is `403` | The token's `scope` claim lacks `jobs:write`. Mint with `"scope":"jobs:read jobs:write"`. |
+| JWT `403 tenant is not active` | The `tenant_id` claim doesn't match an existing/active tenant. Create it via the admin API and use its returned id. |
+| `python3 -c "from app.auth.jwt import ..."` fails on the host | Run it inside the container (`docker compose exec gateway python -c ...`) or the venv, so `app` is importable. |
+
+---
+
+## Stage 7 — part 2 (worker as its own gRPC service) ⬜ (next)
+
+Will extract the worker into a standalone deployable with a typed gRPC contract
+between it and the gateway. Steps appended when it lands.

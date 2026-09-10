@@ -22,6 +22,7 @@
 5E. **Stage 5 (part 1)** — transactional outbox + event backbone (block-by-block)
 5F. **Stage 5 (part 2)** — CQRS read model (block-by-block)
 5G. **Stage 6** — multi-tenancy & identity (block-by-block)
+5H. **Stage 7 (part 1)** — OAuth2/OIDC JWT + scopes (block-by-block)
 6. Cross-cutting design decisions & trade-offs
 7. Interview Q&A — what / why / how
 8. Known gaps and what later stages fix
@@ -890,6 +891,72 @@ table-stakes for any SaaS/API product, and it's where "distributed system" meets
 
 ---
 
+## 5H. Stage 7 (part 1) — OAuth2/OIDC JWT + scopes (block-by-block)
+
+**Idea:** two things. (1) Accept a **second credential type** — an OAuth2/OIDC
+**JWT** — alongside API keys, so the platform can sit behind a real identity
+provider (SSO), not just its own keys. (2) Add **authorization** on top of
+authentication: a credential now carries **scopes**, and each route requires one,
+so a read-only token can't submit work. **Motive:** federation (let an IdP own
+identity) and least-privilege (authN says *who*; authZ says *what you may do* —
+they're different questions and Stage 6 only answered the first).
+
+**The payoff of Stage 6's design:** I built `get_principal` as the *single* auth
+choke point. Adding a whole new credential scheme touches **only that function** —
+every route, the service, and isolation logic are unchanged, because both schemes
+produce the same `Principal`.
+
+### 5H.1 `app/auth/jwt.py` — a dependency-free JWT verifier (HS256)
+- A JWT is `header.payload.signature`, each base64url. The verifier checks the
+  things that actually matter: **signature** (recompute HMAC-SHA256, constant-time
+  compare — proves the token wasn't forged/tampered), **`exp`/`nbf`** with a
+  clock-skew **leeway**, and **`iss`/`aud`** (so a token minted for another
+  service can't be replayed here). It explicitly **rejects `alg:none` and any
+  non-HS256 alg** — the classic JWT alg-confusion attack. Malformed segments/JSON
+  become a clean `JWTError`, never a 500.
+- **Why HS256 + pure stdlib:** HS256 is symmetric HMAC — no crypto library, so
+  tests stay hermetic and the validation is fully visible. Production OIDC uses
+  **RS256** (the IdP signs with a private key; we verify with its public key from
+  a **JWKS** endpoint, selected by the token's `kid`). That's a later increment
+  behind this same `decode_and_verify` shape — and it will use a vetted library,
+  because you hand-roll HMAC but never hand-roll RSA.
+
+### 5H.2 `app/auth/scopes.py` — the authorization vocabulary
+- Constants `JOBS_READ` / `JOBS_WRITE`, an `ALL` set (what an API key gets), and
+  `parse_scopes` which normalises the OAuth2 space-delimited `scope` string
+  ("jobs:read jobs:write") — or a list — into a set.
+
+### 5H.3 `Principal` gains `scopes` + `credential`
+- The frozen `Principal` now carries `scopes: frozenset[str]` and `credential`
+  ("api_key"|"jwt", for audit). `has_scope()` is the check `require_scope` uses.
+
+### 5H.4 `get_principal` becomes multi-scheme (`api/deps.py`)
+- One line of dispatch: a `csk_`-prefixed token → `_principal_from_api_key`
+  (Stage 6, granted **full** scopes — a tenant's root credential);
+  anything else → `_principal_from_jwt`. The JWT path verifies the token, reads
+  the tenant from the configured claim (`jwt_tenant_claim`), confirms that tenant
+  exists and is active (so suspension still applies to SSO users), and derives
+  scopes from the `scope` claim. A blank `JWT_HS256_SECRET` means JWT auth is
+  **off** → such tokens are "unrecognised credential" (not "wrong"), so we don't
+  imply a scheme we haven't enabled.
+
+### 5H.5 `require_scope(scope)` — the authorization gate
+- A dependency **factory**: `require_scope(JOBS_WRITE)` returns a dependency that
+  first runs `get_principal` (so **401** for bad/no credential happens first),
+  then returns **403** if the principal lacks the scope. Routes swap
+  `Depends(get_principal)` for `Depends(require_scope(...))`: submit/cancel need
+  `jobs:write`; get/list/events/document/stream/stats/view need `jobs:read`.
+
+> **Backward compatible by construction:** API keys are granted `ALL` scopes, so
+> every existing Stage-0–6 route and test behaves exactly as before; only JWTs are
+> constrained by their token's scopes.
+
+> **Deferred to Stage 7 part 2 / later:** RS256 + JWKS (real OIDC provider), key
+> rotation/expiry for API keys, finer scopes (per-tenant admin, read-only keys),
+> and extracting the worker into its own gRPC service.
+
+---
+
 ## 6. Cross-cutting design decisions & trade-offs
 
 | Decision | Why | Trade-off / later fix |
@@ -926,6 +993,11 @@ table-stakes for any SaaS/API product, and it's where "distributed system" meets
 | Per-tenant **monthly quota** (usage ledger) | fairness/billing lever, distinct from rate limit | coarse; check+record not atomic → tiny overshoot possible |
 | Separate **admin plane** (shared secret) | solves the credential bootstrap chicken-and-egg | a second secret to manage; blank ⇒ disabled |
 | API keys now, OIDC/JWT later | ship isolation without an IdP dependency | no SSO/federation yet (slots into `get_principal`) |
+| JWT as a 2nd scheme behind one choke point | new credential type touches only `get_principal` | two schemes to reason about; same `Principal` out |
+| HS256 + pure stdlib (verify in-house) | hermetic tests; validation fully visible | symmetric only → RS256/JWKS is a later increment |
+| Reject `alg:none`/non-HS256 explicitly | blocks JWT alg-confusion forgery | must pin the algorithm, not trust the header |
+| Scope-based authZ (`require_scope`) | least privilege; authN vs authZ separated | scopes to define/assign; API keys are full-access for now |
+| API keys granted **all** scopes | Stage 0–6 stays backward-compatible | no read-only API keys yet (a later refinement) |
 | LLM behind a port + scripted fake | tests run with no key/network/cost | one more abstraction layer |
 | Agent guardrails (token budget, max steps) | bound cost + prevent infinite loops | may stop before a hard task finishes |
 | SSE via Redis pub/sub | live progress across processes | live-only (no replay) until Stage 5-style history stream |
@@ -1191,6 +1263,39 @@ separate **admin plane** — `POST /v1/admin/tenants` — authenticated by a sha
 key. If `ADMIN_TOKEN` is unset the admin API is **disabled** (403), never open —
 a missing secret must not mean "no auth".
 
+**Q: You support both API keys and OAuth2/OIDC JWTs — how, without duplicating
+auth everywhere? (Stage 7)**
+Because Stage 6 put authentication behind a single choke point, `get_principal`.
+Adding JWTs touched only that function: it looks at the `Authorization: Bearer`
+value, dispatches on the `csk_` prefix (API key) vs otherwise (JWT), and both
+paths return the **same `Principal`**. Every route, the service, and the isolation
+logic are unchanged — that's the payoff of the ports/choke-point design.
+
+**Q: What exactly do you validate on a JWT?**
+Four things: (1) the **signature** — recompute HMAC-SHA256 over `header.payload`
+and constant-time compare, proving it wasn't forged or tampered; (2) **`exp`/
+`nbf`** with a small clock-skew leeway; (3) **`iss`/`aud`** so a token minted for
+a different service/issuer can't be replayed against us; (4) the **algorithm** —
+I pin HS256 and explicitly reject `alg:none` and other algs, which defeats the
+classic JWT alg-confusion attack. The tenant comes from a configured claim, and I
+still confirm that tenant is active (so suspension applies to SSO users too).
+
+**Q: Why HS256 here when real OIDC uses RS256?**
+HS256 is symmetric HMAC — no crypto dependency — so the learning build stays
+hermetic and the validation is fully visible in ~40 lines. Production uses
+**RS256**: the IdP signs with a private key and I verify with its public key
+fetched from a **JWKS** endpoint (selected by the token's `kid`). That slots in
+behind the same `decode_and_verify` shape and will use a vetted library — you can
+hand-roll an HMAC compare, but you must never hand-roll RSA.
+
+**Q: Authentication vs authorization — where's the line in your code?**
+`get_principal` is **authentication** (who are you? → 401 if we can't tell).
+`require_scope(...)` is **authorization** (may you do this? → 403 if your scopes
+don't include it). They're separate dependencies so the failure modes and status
+codes stay distinct. Submit/cancel require `jobs:write`, reads require
+`jobs:read`; API keys carry all scopes, JWTs carry whatever the `scope` claim
+granted — least privilege for tokens.
+
 ## 8. Known gaps and what later stages fix
 - **MongoDB trajectories + Redis hot state** (polyglot) → **Stage 2**. ✅ done
 - **Multi-store consistency** (Mongo+Postgres+Redis not atomic) → transactional **outbox + CDC**, **Stage 5**.
@@ -1207,7 +1312,10 @@ a missing secret must not mean "no auth".
 - **Outbox for job *dispatch*** (replace the direct Redis enqueue) → same pattern, a small follow-on.
 - **Read model is eventually consistent** — `/view` can briefly 404 after submit; a client wanting strong reads uses the write-side `GET /v1/jobs/{id}`.
 - **Multi-tenancy: API-key auth, tenant isolation, per-tenant quota + usage ledger, admin bootstrap** → **Stage 6**. ✅ done
-- **OAuth2/OIDC (JWT) as a second principal source**, **scoped keys** (read-only vs submit), **key rotation/expiry** → later increments (slot into `get_principal`).
+- **OAuth2/OIDC (JWT) as a second principal source** + **scope-based authorization** → **Stage 7 part 1**. ✅ done
+- **RS256 + JWKS** (verify tokens from a real OIDC provider, not just HS256) → Stage 7 later increment (slots into `decode_and_verify`).
+- **Read-only / scoped API keys** and **key rotation/expiry** → later (API keys are full-access today).
+- **Worker as its own (gRPC) service** → **Stage 7 part 2**.
 - **Per-tenant rate limits** (reuse the Stage-4 bucket keyed by tenant) → small follow-on.
 - **Quota check + usage record aren't atomic** (tiny overshoot under bursts) → acceptable for a coarse monthly quota; a stricter limit would reserve-then-commit.
 
@@ -1235,3 +1343,9 @@ a missing secret must not mean "no auth".
 - **Authentication vs authorization** — *who you are* (the key → principal) vs *what you may touch* (tenant-scoped queries).
 - **Quota** — a per-tenant volume allowance over a period (here monthly submissions), tracked by the usage ledger.
 - **Admin plane** — the separate, shared-secret-guarded surface that mints tenants/keys.
+- **JWT** — a signed, self-describing bearer token: `header.payload.signature` (base64url).
+- **Claims** — the JSON fields in a JWT payload (`iss`, `aud`, `exp`, `sub`, + our `tenant_id`/`scope`).
+- **OAuth2 / OIDC** — the bearer-token authZ framework / the identity layer on top of it (SSO).
+- **JWKS** — the JSON Web Key Set an OIDC provider publishes so verifiers can fetch its public keys (RS256).
+- **Scope** — a permission string a credential carries (`jobs:read`); the unit of authorization.
+- **alg confusion** — a JWT attack that swaps the signing algorithm (e.g. to `none`); defeated by pinning the expected alg.
