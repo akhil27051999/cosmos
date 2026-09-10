@@ -1,0 +1,93 @@
+# Default values for the Cosmos platform chart.
+# Override with `--set key=value` or `-f my-values.yaml`.
+
+# The gateway and worker are the SAME image, started with different commands.
+# Build it from services/gateway (see deploy/README.md), then set repository/tag.
+image:
+  repository: cosmos-gateway
+  tag: latest
+  # IfNotPresent suits a locally-loaded image (minikube/kind); use Always with a
+  # real registry + immutable tags.
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# --- non-secret configuration (rendered into a ConfigMap) ---
+# The connection URLs default to the in-cluster backing services below; leave
+# them blank to use those defaults, or set them to point at managed services.
+config:
+  appEnv: prod
+  mongoDb: cosmos
+  llmProvider: anthropic
+  agentModel: claude-opus-5
+  groqModel: llama-3.3-70b-versatile
+  submitRatePerSec: "20"
+  submitBurst: "40"
+  defaultMonthlyQuota: "1000"
+  workerGrpcPort: "50051"
+  databaseUrl: ""     # blank => postgresql+asyncpg://<user>:<pass>@<release>-postgres:5432/<db>
+  redisUrl: ""        # blank => redis://<release>-redis:6379/0
+  mongoUrl: ""        # blank => mongodb://<release>-mongo:27017
+  redpandaBrokers: "" # blank => <release>-redpanda:9092
+
+# --- secrets (rendered into a Secret) ---
+# For a real deployment, do NOT commit these — use an external secret manager
+# (Sealed Secrets, External Secrets Operator, cloud secret store) and set
+# secrets.create=false to reference an existing Secret named `existingSecret`.
+secrets:
+  create: true
+  existingSecret: ""
+  adminToken: "change-me-admin-token"
+  jwtHs256Secret: ""
+  anthropicApiKey: ""
+  groqApiKey: ""
+
+gateway:
+  replicaCount: 2
+  service:
+    type: ClusterIP
+    port: 8000
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+
+worker:
+  # The worker consumes a shared queue; scaling it up adds throughput. The gRPC
+  # control-plane Service targets one replica for status (fine for ops queries).
+  replicaCount: 1
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 1Gi }
+
+# --- dev backing stores ---
+# Single-replica Deployments so `helm install` gives a runnable stack on a laptop.
+# In production set `enabled: false` and point config.*Url at managed services
+# (RDS/ElastiCache/Atlas/managed Kafka) — nothing else changes.
+backingServices:
+  enabled: true
+  postgres:
+    image: postgres:16-alpine
+    user: cosmos
+    password: cosmos
+    db: cosmos
+    storage: 1Gi
+  redis:
+    image: redis:7-alpine
+  mongo:
+    image: mongo:7
+    storage: 1Gi
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+
+# Pod hardening applied to gateway + worker.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000

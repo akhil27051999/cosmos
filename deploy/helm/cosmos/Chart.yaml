@@ -1,0 +1,14 @@
+apiVersion: v2
+name: cosmos
+description: >-
+  Cloud-native LLM job-orchestration platform — the FastAPI gateway, the async
+  worker (agent + outbox relay + CQRS projector + gRPC control plane), and the
+  backing stores (Postgres, Redis, MongoDB, Redpanda), packaged for Kubernetes.
+type: application
+# `version` is the CHART version (bump on chart changes); `appVersion` tracks the
+# application image these templates are written for.
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.23.0-0"
+maintainers:
+  - name: akhil27051999
