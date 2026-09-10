@@ -1,0 +1,9 @@
+# --- runtime ---
+kopf==1.37.2          # Kubernetes Operator Pythonic Framework (watch + handlers)
+kubernetes==31.0.0    # official k8s client (used to upsert the credentials Secret)
+httpx==0.28.1         # calls the gateway admin API
+
+# --- tests (only the pure reconcile logic is unit-tested; needs neither kopf
+#     nor a cluster) ---
+pytest==8.3.4
+pytest-asyncio==0.25.0
