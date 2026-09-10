@@ -68,6 +68,11 @@ class Job:
     # to MongoDB (see domain/document.py) because it's large and schema-varying;
     # the Job entity now holds only small, transactional METADATA.
     id: uuid.UUID = field(default_factory=uuid.uuid4)
+    # Stage 6: every job belongs to a TENANT. This is the isolation key — the
+    # repository scopes reads/writes by it, so one tenant can never see another's
+    # jobs. Defaulted so pre-Stage-6 code paths (and tests) still construct a Job,
+    # but the submit path always stamps the authenticated tenant.
+    tenant_id: str = "public"
     status: JobStatus = JobStatus.PENDING
     # The idempotency key ties a job to the client's "please do this exactly
     # once" request. Two submits with the same key must yield the same job.

@@ -23,14 +23,19 @@ from app.core.db import Base
 class JobModel(Base):
     __tablename__ = "jobs"
     __table_args__ = (
-        # A DB-level unique constraint is the *race-proof* backstop for
-        # idempotency: even if two identical requests arrive at the same instant
-        # and both pass the "does it exist?" check, the database will reject the
-        # second insert. Application logic alone can't guarantee this.
-        UniqueConstraint("idempotency_key", name="uq_jobs_idempotency_key"),
+        # Stage 6: idempotency is now scoped PER TENANT — the race-proof backstop
+        # is a unique constraint on (tenant_id, idempotency_key), so two different
+        # tenants may reuse the same key string without colliding, while a single
+        # tenant still can't create duplicates under a repeated key.
+        UniqueConstraint(
+            "tenant_id", "idempotency_key", name="uq_jobs_tenant_idempotency_key"
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    # Stage 6: the isolation key. Indexed because every tenant-scoped read filters
+    # on it (get/list), and it's half of the idempotency uniqueness above.
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
     # payload moved to MongoDB in Stage 2 — this table is metadata-only now.
     idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)

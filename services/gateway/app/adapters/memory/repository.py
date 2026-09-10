@@ -32,18 +32,28 @@ class InMemoryJobRepository:
     async def add(self, job: Job) -> None:
         self._jobs[job.id] = copy.deepcopy(job)
 
-    async def get(self, job_id: uuid.UUID) -> Job | None:
+    async def get(self, job_id: uuid.UUID, tenant_id: str | None = None) -> Job | None:
         found = self._jobs.get(job_id)
-        return copy.deepcopy(found) if found else None
+        if found is None:
+            return None
+        # Tenant isolation: a row belonging to another tenant reads as "missing".
+        if tenant_id is not None and found.tenant_id != tenant_id:
+            return None
+        return copy.deepcopy(found)
 
-    async def get_by_idempotency_key(self, key: str) -> Job | None:
+    async def get_by_idempotency_key(self, key: str, tenant_id: str) -> Job | None:
         for job in self._jobs.values():
-            if job.idempotency_key == key:
+            if job.idempotency_key == key and job.tenant_id == tenant_id:
                 return copy.deepcopy(job)
         return None
 
-    async def list(self, limit: int = 50, offset: int = 0) -> list[Job]:
-        ordered = sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
+    async def list(
+        self, limit: int = 50, offset: int = 0, tenant_id: str | None = None
+    ) -> list[Job]:
+        values = self._jobs.values()
+        if tenant_id is not None:
+            values = [j for j in values if j.tenant_id == tenant_id]
+        ordered = sorted(values, key=lambda j: j.created_at, reverse=True)
         return [copy.deepcopy(j) for j in ordered[offset : offset + limit]]
 
     async def update(self, job: Job, expected_version: int) -> Job:

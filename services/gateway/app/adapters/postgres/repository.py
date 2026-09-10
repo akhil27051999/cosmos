@@ -28,6 +28,7 @@ def _to_entity(row: JobModel) -> Job:
     """DB row -> domain object. (payload lives in Mongo now, not here.)"""
     return Job(
         id=row.id,
+        tenant_id=row.tenant_id,
         status=JobStatus(row.status),
         idempotency_key=row.idempotency_key,
         version=row.version,
@@ -40,6 +41,7 @@ def _to_model(job: Job) -> JobModel:
     """Domain object -> DB row."""
     return JobModel(
         id=job.id,
+        tenant_id=job.tenant_id,
         status=job.status.value,
         idempotency_key=job.idempotency_key,
         version=job.version,
@@ -66,22 +68,29 @@ class PostgresJobRepository:
             await self._session.rollback()
             raise VersionConflict("idempotency key already used") from exc
 
-    async def get(self, job_id: uuid.UUID) -> Job | None:
+    async def get(self, job_id: uuid.UUID, tenant_id: str | None = None) -> Job | None:
         row = await self._session.get(JobModel, job_id)
-        return _to_entity(row) if row else None
+        if row is None:
+            return None
+        # Tenant isolation: another tenant's row reads as "missing" (None).
+        if tenant_id is not None and row.tenant_id != tenant_id:
+            return None
+        return _to_entity(row)
 
-    async def get_by_idempotency_key(self, key: str) -> Job | None:
-        stmt = select(JobModel).where(JobModel.idempotency_key == key)
+    async def get_by_idempotency_key(self, key: str, tenant_id: str) -> Job | None:
+        stmt = select(JobModel).where(
+            JobModel.idempotency_key == key, JobModel.tenant_id == tenant_id
+        )
         row = (await self._session.execute(stmt)).scalar_one_or_none()
         return _to_entity(row) if row else None
 
-    async def list(self, limit: int = 50, offset: int = 0) -> list[Job]:
-        stmt = (
-            select(JobModel)
-            .order_by(JobModel.created_at.desc())
-            .limit(limit)
-            .offset(offset)
-        )
+    async def list(
+        self, limit: int = 50, offset: int = 0, tenant_id: str | None = None
+    ) -> list[Job]:
+        stmt = select(JobModel).order_by(JobModel.created_at.desc())
+        if tenant_id is not None:
+            stmt = stmt.where(JobModel.tenant_id == tenant_id)
+        stmt = stmt.limit(limit).offset(offset)
         rows = (await self._session.execute(stmt)).scalars().all()
         return [_to_entity(r) for r in rows]
 

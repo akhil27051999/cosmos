@@ -29,19 +29,29 @@ class JobRepository(Protocol):
         """Persist a brand-new job."""
         ...
 
-    async def get(self, job_id: uuid.UUID) -> Job | None:
-        """Return the job, or None if there is no such id."""
-        ...
+    async def get(self, job_id: uuid.UUID, tenant_id: str | None = None) -> Job | None:
+        """Return the job, or None if there is no such id.
 
-    async def get_by_idempotency_key(self, key: str) -> Job | None:
-        """Return the job previously created under this idempotency key, if any.
-
-        This is the lookup that makes job submission idempotent.
+        Stage 6 TENANT ISOLATION: when `tenant_id` is given, the row is returned
+        only if it belongs to that tenant — a cross-tenant id looks exactly like
+        a missing id (None), so we never even leak that another tenant's job
+        exists. The API always passes the caller's tenant; the worker passes None
+        (it processes jobs across all tenants as a trusted system component).
         """
         ...
 
-    async def list(self, limit: int = 50, offset: int = 0) -> list[Job]:
-        """Return a page of jobs, newest first."""
+    async def get_by_idempotency_key(self, key: str, tenant_id: str) -> Job | None:
+        """Return the job previously created by THIS tenant under this key, if any.
+
+        Idempotency is scoped per-tenant: two different tenants may reuse the same
+        key string without colliding.
+        """
+        ...
+
+    async def list(
+        self, limit: int = 50, offset: int = 0, tenant_id: str | None = None
+    ) -> list[Job]:
+        """Return a page of jobs, newest first, scoped to `tenant_id` if given."""
         ...
 
     async def update(self, job: Job, expected_version: int) -> Job:
