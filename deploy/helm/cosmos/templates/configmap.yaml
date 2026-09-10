@@ -1,0 +1,24 @@
+{{- $fn := include "cosmos.fullname" . -}}
+{{- $pg := .Values.backingServices.postgres -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fn }}-config
+  labels: {{- include "cosmos.labels" . | nindent 4 }}
+data:
+  APP_ENV: {{ .Values.config.appEnv | quote }}
+  MONGO_DB: {{ .Values.config.mongoDb | quote }}
+  LLM_PROVIDER: {{ .Values.config.llmProvider | quote }}
+  AGENT_MODEL: {{ .Values.config.agentModel | quote }}
+  GROQ_MODEL: {{ .Values.config.groqModel | quote }}
+  SUBMIT_RATE_PER_SEC: {{ .Values.config.submitRatePerSec | quote }}
+  SUBMIT_BURST: {{ .Values.config.submitBurst | quote }}
+  DEFAULT_MONTHLY_QUOTA: {{ .Values.config.defaultMonthlyQuota | quote }}
+  WORKER_GRPC_PORT: {{ .Values.config.workerGrpcPort | quote }}
+  # The gateway reaches the worker's gRPC control plane at its Service name.
+  WORKER_GRPC_TARGET: {{ printf "%s-worker:%s" $fn .Values.config.workerGrpcPort | quote }}
+  # Connection URLs: use the override if set, else the in-cluster service names.
+  DATABASE_URL: {{ .Values.config.databaseUrl | default (printf "postgresql+asyncpg://%s:%s@%s-postgres:5432/%s" $pg.user $pg.password $fn $pg.db) | quote }}
+  REDIS_URL: {{ .Values.config.redisUrl | default (printf "redis://%s-redis:6379/0" $fn) | quote }}
+  MONGO_URL: {{ .Values.config.mongoUrl | default (printf "mongodb://%s-mongo:27017" $fn) | quote }}
+  REDPANDA_BROKERS: {{ .Values.config.redpandaBrokers | default (printf "%s-redpanda:9092" $fn) | quote }}
