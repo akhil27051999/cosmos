@@ -87,6 +87,16 @@ services:
       JWT_AUDIENCE: ${JWT_AUDIENCE:-}
       # Stage 7 pt2: where the gateway reaches the worker's gRPC control plane.
       WORKER_GRPC_TARGET: ${WORKER_GRPC_TARGET:-worker:50051}
+      # Stage 10: structured logs — "json" (default) or "text" for local reading.
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      # Stage 12: SLO targets surfaced at GET /v1/admin/slo.
+      SLO_AVAILABILITY_TARGET: ${SLO_AVAILABILITY_TARGET:-0.99}
+      SLO_LATENCY_THRESHOLD_SECONDS: ${SLO_LATENCY_THRESHOLD_SECONDS:-0.5}
+      SLO_LATENCY_TARGET: ${SLO_LATENCY_TARGET:-0.95}
+      # Stage 12: chaos fault injection (OFF by default; game-day only).
+      CHAOS_ENABLED: ${CHAOS_ENABLED:-false}
+      CHAOS_FAULT_RATE: ${CHAOS_FAULT_RATE:-0.0}
+      CHAOS_LATENCY_MS: ${CHAOS_LATENCY_MS:-0}
     ports:
       - "8000:8000"
     depends_on:

@@ -22,7 +22,10 @@ cosmos-platform/
 ├── deploy/
 │   └── helm/cosmos/      # Kubernetes Helm chart for the whole platform (Stage 8)
 ├── docs/
-│   └── STAGES.md         # what each stage adds + test/troubleshoot steps
+│   ├── STAGES.md              # what each stage adds + test/troubleshoot steps
+│   ├── END-TO-END-TESTING.md  # run + verify the whole platform locally
+│   ├── ENGINEERING-NOTES.md   # block-by-block "why", + interview Q&A
+│   └── LAB-LOG.md             # commands, gotchas, what exists now
 └── README.md
 ```
 
