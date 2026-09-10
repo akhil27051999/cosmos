@@ -51,3 +51,7 @@ class QuotaExceeded(DomainError):
 class ServiceUnavailable(DomainError):
     """An upstream dependency we call synchronously is unreachable (e.g. the
     worker's gRPC control plane is down). -> HTTP 503."""
+
+
+class ExperimentNotFound(DomainError):
+    """Asked for an experiment key that doesn't exist. -> HTTP 404."""
