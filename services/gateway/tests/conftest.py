@@ -41,6 +41,7 @@ from app.adapters.memory.read_model import InMemoryReadModel
 from app.adapters.memory.repository import InMemoryJobRepository
 from app.adapters.memory.stream_bus import InMemoryStreamBus
 from app.adapters.memory.usage_ledger import InMemoryUsageLedger
+from app.adapters.memory.worker_control import InMemoryWorkerControlClient
 from app.api.deps import (
     get_document_store,
     get_event_store,
@@ -54,6 +55,7 @@ from app.api.deps import (
     get_stream_bus,
     get_submit_rate_limiter,
     get_usage_ledger,
+    get_worker_control,
 )
 from app.application.job_service import JobService
 from app.auth.keys import generate_api_key
@@ -79,6 +81,7 @@ async def env():
     read_model = InMemoryReadModel()
     identity = InMemoryIdentityStore()
     usage = InMemoryUsageLedger()
+    worker_control = InMemoryWorkerControlClient()
 
     # Seed one tenant + a real API key. The plaintext is what the client sends;
     # the store holds only the hash (as in production).
@@ -98,7 +101,8 @@ async def env():
         read_model=read_model, identity=identity, usage=usage, service=service,
         limiter=limiter, tenant_id=tenant.id, api_key=api_key,
         admin_token=os.environ["ADMIN_TOKEN"],
-        jwt_secret=os.environ["JWT_HS256_SECRET"], app=app,
+        jwt_secret=os.environ["JWT_HS256_SECRET"],
+        worker_control=worker_control, app=app,
     )
 
     # Point every provider at the shared in-memory instances.
@@ -112,6 +116,7 @@ async def env():
     app.dependency_overrides[get_read_model_store] = lambda: read_model
     app.dependency_overrides[get_identity_store] = lambda: identity
     app.dependency_overrides[get_usage_ledger] = lambda: usage
+    app.dependency_overrides[get_worker_control] = lambda: worker_control
     app.dependency_overrides[get_job_service] = lambda: service
     # Read the limiter off the namespace each call, so a test can swap it.
     app.dependency_overrides[get_submit_rate_limiter] = lambda: ns.limiter
