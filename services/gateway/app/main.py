@@ -25,6 +25,7 @@ from app.api import (
     routes_jobs,
     routes_metrics,
     routes_read,
+    routes_saga,
 )
 from app.api.errors import install_error_handlers
 from app.core.config import get_settings
@@ -72,6 +73,7 @@ def create_app() -> FastAPI:
     app.include_router(routes_read.router)
     app.include_router(routes_admin.router)
     app.include_router(routes_experiments.router)
+    app.include_router(routes_saga.router)
 
     return app
 

@@ -23,6 +23,7 @@ from app.adapters.postgres.identity_store import PostgresIdentityStore
 from app.adapters.postgres.outbox import PostgresOutbox
 from app.adapters.postgres.read_model import PostgresReadModel
 from app.adapters.postgres.repository import PostgresJobRepository
+from app.adapters.postgres.saga_store import PostgresSagaStore
 from app.adapters.postgres.usage_ledger import PostgresUsageLedger
 from app.application.experiment_service import ExperimentService
 from app.application.job_service import JobService
@@ -43,6 +44,7 @@ from app.ports.outbox import OutboxWriter
 from app.ports.read_model import ReadModelStore
 from app.ports.experiment_store import ExperimentStore
 from app.ports.exposure_log import ExposureLog
+from app.ports.saga_store import SagaStore
 from app.ports.usage_ledger import UsageLedger
 from app.ports.worker_control import WorkerControlClient
 from app.resilience.rate_limiter import RateLimiter
@@ -121,6 +123,12 @@ def get_experiment_service(
     exposures: ExposureLog = Depends(get_exposure_log),
 ) -> ExperimentService:
     return ExperimentService(store, exposures)
+
+
+# ---- Stage 11: saga orchestration ---------------------------------------
+
+def get_saga_store() -> SagaStore:
+    return PostgresSagaStore(get_sessionmaker())
 
 
 def _extract_key(authorization: str | None, x_api_key: str | None) -> str | None:

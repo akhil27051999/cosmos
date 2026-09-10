@@ -184,6 +184,40 @@ class AssignmentOut(BaseModel):
         return cls.model_validate(a)
 
 
+class OnboardingRequest(BaseModel):
+    """Request body for POST /v1/admin/onboarding (runs the onboarding saga)."""
+
+    name: str = Field(..., min_length=1)
+    monthly_quota: int | None = Field(default=None, ge=1)
+
+
+class SagaStepOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    name: str
+    status: str
+
+
+class SagaInstanceOut(BaseModel):
+    """A saga instance's state (returned by the onboarding + get-saga endpoints)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    status: str
+    steps: list[SagaStepOut]
+    context: dict
+    error: str | None
+
+    @classmethod
+    def from_entity(cls, inst) -> "SagaInstanceOut":
+        return cls.model_validate({
+            "id": inst.id, "name": inst.name, "status": inst.status.value,
+            "steps": [{"name": s.name, "status": s.status.value} for s in inst.steps],
+            "context": inst.context, "error": inst.error,
+        })
+
+
 class WorkerStatusOut(BaseModel):
     """A worker's control-plane status (GET /v1/admin/worker/status), fetched
     from the worker over gRPC (Stage 7 part 2)."""
