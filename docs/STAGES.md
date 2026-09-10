@@ -410,10 +410,194 @@ done
 | A job hangs then fails after ~60s | The provider stalled and hit `LLM_TIMEOUT_S`; it's retried per `RETRY_MAX_ATTEMPTS`. Lower the timeout for faster failover, or raise attempts for flakier providers. |
 | Breaker seems stuck open | It reopens for `BREAKER_RESET_S` after each failed probe. If the provider is genuinely down, that's correct — fix the provider or switch `LLM_PROVIDER`. |
 | Load-shed rejects legit traffic under multiple gateway replicas | Good — the limit is *shared* via Redis (that's the point). Size `SUBMIT_RATE_PER_SEC` for total capacity, not per replica. |
+| **Code change has no effect** (e.g. rate-limit not enforced, new endpoint 404s) | `docker compose up -d` reuses the **old image** — it only recreates containers. **Code** changes need a rebuild: `docker compose up -d --build`. (Env-only changes don't; the `Dockerfile` bakes code in at build via `COPY app ./app`.) |
+| `curl` prints **`000`** right after `up -d` | `000` = couldn't connect: the app hadn't finished booting when you fired the request. Wait for readiness first: `until curl -sf localhost:8000/healthz >/dev/null; do sleep 1; done`. Never hit a container the instant it says "Started". |
+| Env change (e.g. `SUBMIT_BURST`) didn't take effect | Two causes: (1) you *assigned* but didn't **`export`** it (`VAR=3` alone isn't seen by compose's `${VAR}`; use `export VAR=3`); (2) the container wasn't recreated — use `docker compose up -d --force-recreate gateway`. Verify with `docker compose exec gateway env | grep -i submit`. |
+| Rate limit behaves oddly after changing the limit | The bucket state lives in Redis and **survives restarts** (that's how it's shared across replicas). Reset it for a clean test: `docker compose exec redis redis-cli DEL ratelimit:submit`. |
 
 ---
 
-## Stage 5 — event-driven backbone ⬜ (next)
+## Stage 5 — event-driven backbone 🟡 (part 1: outbox + bus)
 
-Will introduce Kafka/Redpanda as the backbone with CQRS read models, the
-transactional outbox, Saga, and CDC. Steps appended when it lands.
+**What part 1 adds:** the **transactional outbox** + a message-bus backbone.
+
+- Every domain event is **staged in an `outbox` table in the same DB transaction** that writes it (`JobService._stage_event`) — so "state changed" and "event to publish" commit atomically. A lost publish becomes impossible.
+- A background **relay** (`app/relay.py`, running inside the worker) drains unpublished outbox rows to **Redpanda/Kafka** (`job-events` topic), marking each done — **publish-before-mark = at-least-once**.
+- New: `MessageBus` port (`app/ports/message_bus.py`) with Redpanda (`aiokafka`) + in-memory adapters; `Outbox` port + Postgres/in-memory adapters; `redpanda` service in compose.
+
+**Deferred to later increments:** CQRS read model (the `job-events` consumer/projector), Saga, CDC, schema registry, exactly-once consumer semantics.
+
+### Test steps
+
+**A. Automated (no infra — seconds)**
+```bash
+cd services/gateway && source .venv/bin/activate && pip install -r requirements.txt && pytest -q
+```
+Expect **44 passed** (adds 4 outbox tests: events are staged; the relay publishes-then-marks; it's idempotent). Tests use the in-memory bus — no Redpanda needed.
+
+**B. End-to-end (Docker — now also starts Redpanda)**
+```bash
+cd services/gateway
+docker compose up -d --build            # +redpanda; the worker runs the relay
+until curl -sf localhost:8000/healthz >/dev/null; do sleep 1; done; echo ready
+# submit a job; its events flow: DB (outbox) -> relay -> Redpanda topic "job-events"
+curl -s -XPOST localhost:8000/v1/jobs -H 'content-type: application/json' -d '{"payload":{"prompt":"hi"}}'
+```
+Watch the outbox drain and the events land on the topic:
+```bash
+# outbox rows should end up with a published_at (relay ran):
+docker compose exec postgres psql -U cosmos -d cosmos -c "SELECT seq,topic,value->>'type',published_at IS NOT NULL AS published FROM outbox ORDER BY seq;"
+# consume the topic from the broker (host tool):
+docker compose exec redpanda rpk topic consume job-events --num 5 --offset start
+```
+You'll see `submitted → started → succeeded` on `job-events`, and every outbox row marked published.
+
+**What to verify (learning checkpoints):**
+- Each job produces outbox rows for its events, all eventually `published_at IS NOT NULL`.
+- The same events appear on the Redpanda `job-events` topic, keyed by job id (so one job's events stay ordered on one partition).
+- Kill the worker mid-run and restart — unpublished rows are still published (at-least-once); nothing is lost.
+
+### Troubleshooting
+
+| Symptom | Cause & fix |
+|---|---|
+| `pip install` fails on **aiokafka** (new Python) | Same as before — use Docker (Python 3.12) or a 3.12 venv. Tests don't import aiokafka (in-memory bus). |
+| Outbox rows never get `published_at` | The relay can't reach Redpanda. `docker compose logs redpanda`; confirm `REDPANDA_BROKERS=redpanda:9092` in the worker (`docker compose exec worker env | grep REDPANDA`). The relay retries, so it self-heals once the broker is up. |
+| `rpk topic consume` says the topic doesn't exist | It's auto-created on first publish; submit a job first. Or `docker compose exec redpanda rpk topic create job-events`. |
+| Redpanda container unhealthy on an old/small Docker | It's a single-node dev broker; give Docker ≥1 CPU / 1–2 GB. The worker uses `depends_on: service_started` (not healthy), so it won't block the stack — the relay just retries. |
+| Events appear twice on the topic | Expected under crash recovery — publish-before-mark is **at-least-once**. Consumers (the CQRS projector, next increment) dedupe by event/outbox id. |
+
+---
+
+## Stage 5 — part 2 (CQRS read model) ✅
+
+**What part 2 adds:** the query side of CQRS. A **projector** consumes the
+`job-events` topic and folds each event into a denormalized **read model**
+(`job_read_model` table), which the API serves for fast queries — separate from
+the write model (jobs/job_events).
+
+- `app/projector.py` — `project_once` (poll → apply → commit) + `run_projector` (loop), running as a background task in the worker.
+- Read model: `ReadModelStore` port + Postgres (atomic upsert `ON CONFLICT … WHERE version < EXCLUDED.version`) + in-memory adapters.
+- **Idempotent under at-least-once**: each event carries the job `version`; the projector applies **last-writer-wins by version**, so duplicate/out-of-order events can't corrupt the view.
+- New endpoints: `GET /v1/stats` (counts per status) and `GET /v1/jobs/{id}/view` (the projection).
+- The bus consumer side (`poll`/`commit`) is now implemented in both adapters.
+
+### Test steps
+
+**A. Automated**
+```bash
+cd services/gateway && source .venv/bin/activate && pytest -q
+```
+Expect **48 passed** (adds 4 CQRS tests: projector builds the model end-to-end via the in-memory bus; apply is idempotent + LWW; `/v1/stats`; `/v1/jobs/{id}/view` + 404).
+
+**B. End-to-end (Docker)**
+```bash
+cd services/gateway && docker compose up -d --build
+until curl -sf localhost:8000/healthz >/dev/null; do sleep 1; done; echo ready
+# submit a couple of jobs, let the worker + projector run (~2s)
+curl -s -XPOST localhost:8000/v1/jobs -H 'content-type: application/json' -d '{"payload":{"prompt":"hi"}}' >/dev/null
+curl -s -XPOST localhost:8000/v1/jobs -H 'content-type: application/json' -d '{"payload":{"prompt":"hi again"}}' >/dev/null
+sleep 3
+curl -s localhost:8000/v1/stats | python3 -m json.tool          # counts per status, from the read model
+# view one job's projection (grab an <ID> from a submit response):
+curl -s localhost:8000/v1/jobs/<ID>/view | python3 -m json.tool
+```
+Or look at the read model + the projector's consumer group directly:
+```bash
+docker compose exec postgres psql -U cosmos -d cosmos -c "SELECT job_id,status,version,event_count FROM job_read_model;"
+docker compose exec redpanda rpk group describe cqrs-projector   # lag should be ~0
+```
+
+**What to verify (learning checkpoints):**
+- `/v1/stats` reflects the jobs you submitted (e.g. `succeeded` count rises as the worker finishes them).
+- `/v1/jobs/{id}/view` shows the projected `status`/`version`/`event_count` — the *read* model, not the write tables.
+- It's **eventually consistent**: right after submit, `/view` may 404 for a beat until the projector catches up (the write-side `GET /v1/jobs/{id}` is immediate).
+- Kill/restart the worker — the projected counts stay correct (idempotent LWW; no double counting).
+
+### Troubleshooting
+
+| Symptom | Cause & fix |
+|---|---|
+| `/v1/stats` empty or `/view` 404s for a real job | The projector hasn't caught up (or can't reach Redpanda). Give it a second; check `docker compose logs worker` for `[projector]` errors and `rpk group describe cqrs-projector` for lag. |
+| `event_count` looks doubled | Shouldn't happen — apply is version-guarded. If you see it, an event was staged without a `version` field; confirm `JobService._stage_event` includes `version`. |
+| Consumer group not advancing | The projector commits only after applying a batch. If it errors mid-batch it won't commit and will re-poll the same batch (safe). Fix the underlying error shown in the worker logs. |
+| Read model diverges from write model | It's eventually consistent by design. Persistent divergence = projector down; restart the worker (it re-consumes from its committed offset). |
+
+---
+
+## Stage 6 — multi-tenancy & identity ✅
+
+**What it adds:** the platform becomes **multi-tenant**. Every request now
+authenticates with an **API key**, every job belongs to a **tenant**, and every
+read/write is **scoped** to the caller's tenant. A per-tenant **monthly quota**
+(backed by a usage ledger) governs how much each tenant may submit, and an
+**admin API** mints the first tenants and keys.
+
+- Identity domain: `Tenant`, `ApiKey` (only a **hash** of the secret is stored), `Principal` (the authenticated caller).
+- `app/auth/keys.py` — mint/parse/verify keys of the form `csk_<key_id>_<secret>`; constant-time compare.
+- Auth choke point: `get_principal` (in `deps.py`) verifies the key → tenant, or raises **401/403**.
+- Isolation: `Job` gains `tenant_id`; the repository scopes `get`/`list`/idempotency by it; a cross-tenant id is a **404** (never leaked). The CQRS read model carries `tenant_id` too, so `/v1/stats` and `/view` are per-tenant.
+- Quota: `JobService.submit` checks the tenant is active and under its monthly quota (**429** `quota_exceeded`), then records usage in the ledger (atomic upsert-increment).
+- Admin: `POST /v1/admin/tenants` (+ `/keys`), guarded by `ADMIN_TOKEN` (blank ⇒ admin API disabled).
+
+### Test steps
+
+**A. Automated**
+```bash
+cd services/gateway && source .venv/bin/activate && pytest -q
+```
+Expect **60 passed** (adds 12 identity tests: key crypto, 401 missing/invalid/revoked, tenant isolation, quota 429, suspended tenant 403, admin bootstrap).
+
+**B. End-to-end (Docker)** — auth is now required, so you need a key first.
+```bash
+cd services/gateway
+export ADMIN_TOKEN=dev-admin-secret          # enables the admin API
+docker compose up -d --build
+until curl -sf localhost:8000/healthz >/dev/null; do sleep 1; done; echo ready
+
+# 1) A call with NO key is rejected.
+curl -s -o /dev/null -w '%{http_code}\n' -XPOST localhost:8000/v1/jobs \
+  -H 'content-type: application/json' -d '{"payload":{"prompt":"hi"}}'      # -> 401
+
+# 2) Create a tenant + its first API key (admin token, NOT an API key).
+curl -s -XPOST localhost:8000/v1/admin/tenants \
+  -H "X-Admin-Token: $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d '{"name":"Acme","monthly_quota":100}' | python3 -m json.tool
+# copy the "api_key" from the response:
+export KEY=csk_...                            # paste it here
+
+# 3) Submit as that tenant (Bearer key) -> 202.
+curl -s -XPOST localhost:8000/v1/jobs \
+  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"payload":{"prompt":"hello"}}' | python3 -m json.tool
+# note the returned "tenant_id"; list + stats are scoped to this tenant only:
+curl -s localhost:8000/v1/jobs  -H "Authorization: Bearer $KEY" | python3 -m json.tool
+curl -s localhost:8000/v1/stats -H "Authorization: Bearer $KEY" | python3 -m json.tool
+```
+
+**Prove tenant isolation:** make a *second* tenant/key, then try to fetch the
+first tenant's job id with the second key — you get a **404**, as if it doesn't
+exist. Its jobs never appear in the second tenant's list or stats.
+
+**Prove the quota:** create a tenant with `"monthly_quota":1`, submit twice — the
+second returns **429** `quota_exceeded` with a `Retry-After`.
+
+### Troubleshooting
+
+| Symptom | Cause & fix |
+|---|---|
+| Every request is `401 unauthenticated` | Missing/'' `Authorization`. Send `Authorization: Bearer csk_...` (or `X-API-Key: csk_...`). |
+| `POST /v1/admin/tenants` returns `403 forbidden` "admin API is disabled" | `ADMIN_TOKEN` is unset in the gateway. `export ADMIN_TOKEN=... ` then `docker compose up -d` (env-only change → no `--build`). |
+| Admin call returns `401` | Wrong/missing `X-Admin-Token`. It must equal the gateway's `ADMIN_TOKEN`. |
+| A valid key suddenly 401s | The key is revoked, or the row is gone (fresh volume). Mint a new one via the admin API. |
+| Submits 429 with `quota_exceeded` (not `rate_limited`) | The tenant hit its **monthly** quota (different lever from the Stage-4 per-second load-shed). Raise `monthly_quota` on a new tenant, or wait for the next calendar month. |
+| Lost the API key | It's shown once and only the hash is stored — it **cannot** be recovered. Mint a new key: `POST /v1/admin/tenants/{id}/keys`. |
+| `/v1/jobs/{id}/view` 404s for your own job | Either not projected yet (eventual consistency — wait a beat) or you're using a different tenant's key than the one that submitted it. |
+
+---
+
+## Stage 7 — the worker as its own (Go/gRPC) service ⬜ (next)
+
+Will extract the worker into a standalone service with a typed gRPC contract, and
+add OAuth2/OIDC (JWT) as a second principal source alongside API keys. Steps
+appended when it lands.

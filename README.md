@@ -33,7 +33,9 @@ As later stages arrive, `services/` grows (e.g. a `worker/`), and a top-level
 | **2** | Polyglot persistence: MongoDB for the job document (payload + result), Redis hot-state cache (cache-aside + invalidate-on-write) | ✅ built |
 | **3** | The agent layer: real Claude agent loop (tool use + token budget), trajectory persisted to Mongo, live SSE streaming | ✅ built |
 | **4** | Resilience: `ResilientLLMClient` decorator (timeout → retry+backoff/jitter → circuit breaker → fallback provider) + distributed token-bucket rate limit and edge load-shedding (429) | ✅ built |
-| … | Kafka/CQRS/Saga → multi-tenancy → gRPC/Go/mesh → k8s operator → frontend/A-B → preview envs → cloud/multi-region → observability/SRE | ⬜ |
+| **5** | Event-driven backbone: **transactional outbox** + relay → Redpanda/Kafka; **CQRS** projector builds a read model (`/v1/stats`, `/v1/jobs/{id}/view`), idempotent under at-least-once. Saga & CDC are later increments. | 🟢 pts 1–2 |
+| **6** | Multi-tenancy & identity: **API-key auth** (hashed keys), **tenant isolation** on every read/write, per-tenant **monthly quota** + usage ledger, admin bootstrap to mint tenants/keys. OAuth2/OIDC (JWT) is a later increment. | ✅ built |
+| … | OIDC/JWT → Saga/CDC → gRPC/Go/mesh → k8s operator → frontend/A-B → preview envs → cloud/multi-region → observability/SRE | ⬜ |
 
 ## Quick start (Stage 0)
 

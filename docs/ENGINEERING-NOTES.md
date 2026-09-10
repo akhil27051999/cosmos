@@ -19,6 +19,9 @@
 5B. **Stage 2** — polyglot persistence (block-by-block)
 5C. **Stage 3** — the agent layer (block-by-block)
 5D. **Stage 4** — resilience (block-by-block)
+5E. **Stage 5 (part 1)** — transactional outbox + event backbone (block-by-block)
+5F. **Stage 5 (part 2)** — CQRS read model (block-by-block)
+5G. **Stage 6** — multi-tenancy & identity (block-by-block)
 6. Cross-cutting design decisions & trade-offs
 7. Interview Q&A — what / why / how
 8. Known gaps and what later stages fix
@@ -647,6 +650,246 @@ agent loop is untouched — same trick as every other stage.
 
 ---
 
+## 5E. Stage 5 (part 1) — transactional outbox + event backbone (block-by-block)
+
+**Idea:** give the platform a durable, replayable **event backbone** (Kafka/
+Redpanda), and get events onto it **reliably** — never losing one to a crash
+between the DB write and the publish. **Motive:** this is the substrate for CQRS,
+CDC, and analytics, and the **transactional outbox** is the canonical fix for the
+dual-write problem we've flagged since Stage 1.
+
+**The dual-write problem:** writing to Postgres and publishing to the bus are two
+systems; a crash between them loses one. You can't wrap both in one transaction.
+
+**The outbox fix:** make the publish a *database write*. In the same transaction
+as the event, insert an `outbox` row. Now it's a single atomic commit. A separate
+relay reads the outbox and publishes — decoupling correctness (the DB commit)
+from delivery (best-effort, retried).
+
+### 5E.1 `app/ports/message_bus.py` — the backbone port
+- `MessageBus` = `publish` / `poll` / `commit` over topics + consumer groups —
+  the Kafka model (durable log, independent groups, replayable offsets). Only
+  `publish` is used this increment (the relay); `poll`/`commit` are for the CQRS
+  projector next.
+
+### 5E.2 `app/ports/outbox.py` — the outbox port
+- Split into **`OutboxWriter`** (`add`, shares the caller's transaction) and
+  **`OutboxRelay`** (`fetch_unpublished` / `mark_published`, the drainer's side).
+  The docstring states the pattern and the at-least-once consequence.
+
+### 5E.3 `app/adapters/postgres/outbox_models.py` + `outbox.py`
+- An `outbox` table (`topic, key, value, created_at, published_at`) with a
+  **partial index on unpublished rows** so the relay's poll stays cheap as the
+  table grows. `PostgresOutbox` (writer) shares the request/worker session;
+  `PostgresOutboxRelay` (drainer) uses its own short sessions.
+
+### 5E.4 `app/adapters/redpanda/message_bus.py`
+- `RedpandaMessageBus` — a Kafka producer via `aiokafka` (Redpanda speaks the
+  Kafka protocol). `enable_idempotence=True` avoids duplicate/reordered producer
+  writes; the **key = job id** so a job's events stay ordered on one partition.
+  Consumer side lands with the projector.
+
+### 5E.5 `app/relay.py` — the relay loop
+- `relay_once` (pure/testable): fetch a batch → **publish each, THEN mark
+  published**. `run_relay`: loop, sleeping when idle, surviving transient bus
+  errors. The publish-before-mark ordering is what makes delivery at-least-once
+  (a crash re-publishes, never drops).
+
+### 5E.6 Wiring — service + worker
+- **`JobService._stage_event`** adds an outbox row (topic `job-events`) right
+  after each event append — in the SAME session/transaction, so it commits with
+  the state change. Wired into `submit` and every `_transition`.
+- **The worker** runs the relay as a background `asyncio` task alongside the job
+  loop, and builds a `PostgresOutbox` per message so the worker's own
+  started/succeeded events are staged transactionally too. (In prod the relay is
+  its own deployable; co-located here for local simplicity.)
+
+> **Note on the Redis enqueue:** job *dispatch* still uses the Stage-1 Redis
+> queue directly (a small dual-write window remains there). The exact same outbox
+> pattern will replace that enqueue when we move dispatch onto the backbone —
+> this increment proves the pattern on the event stream first.
+
+---
+
+## 5F. Stage 5 (part 2) — CQRS read model (block-by-block)
+
+**Idea:** split reads from writes. The **write model** (jobs + job_events, tuned
+for correctness: state machine, OCC, event log) is a poor shape for queries like
+"how many jobs per status?" or "give me one job's status fast." So we build a
+separate **read model** — a denormalized projection — fed asynchronously from the
+event backbone we just laid down. This is **CQRS** (Command Query Responsibility
+Segregation). **Motive:** reads and writes have different shapes, loads, and
+scaling needs; separating them lets each be optimized independently, and the
+read model can be rebuilt at any time by replaying the log.
+
+**The flow now end-to-end:**
+`service` stages an event (+ outbox row, one commit) → `relay` publishes to the
+`job-events` topic → **`projector`** (a consumer group) folds each event into the
+read model → the API serves it from the read model. Every hop after the commit is
+asynchronous, so the read model is **eventually consistent** with the write side.
+
+### 5F.1 `app/domain/read_model.py` — the projection shape
+- `ReadModelEntry(job_id, status, version, event_count, created_at, updated_at)`
+  — a flat, query-friendly row. It carries `version` because that's what makes
+  the projection **idempotent** (below), and `event_count` so we can see how many
+  events folded in (and prove no double-counting).
+
+### 5F.2 `app/ports/read_model.py` — the ReadModelStore port
+- `apply(event) -> bool` (fold one event; returns whether it changed anything),
+  `get(job_id)`, and `stats()` (counts per status). Returning a **bool** from
+  `apply` is deliberate — it lets the projector and tests assert idempotency
+  (a duplicate returns `False`).
+
+### 5F.3 `app/ports/message_bus.py` — the consumer side lands
+- Part 1 only used `publish`. Now the projector needs `poll` (read a batch for a
+  consumer group) and `commit(group)` (advance that group's offset after a batch
+  is safely applied). `commit` takes the **group** so different consumers track
+  independent offsets over the same log — the whole point of Kafka-style groups.
+
+### 5F.4 Adapters — `memory/read_model.py` + `postgres/read_model.py`
+- **In-memory** (`InMemoryReadModel`): a dict keyed by job id, with the
+  **last-writer-wins by version** rule (ignore an event whose `version` ≤ the
+  stored one). Used by every test — the projector is exercised with no infra.
+- **Postgres** (`PostgresReadModel`): a `job_read_model` table, upserted with one
+  atomic statement:
+  `insert(...).on_conflict_do_update(..., where=(row.version < excluded.version))`.
+  The `WHERE` on the conflict clause pushes the LWW rule **into the database**, so
+  concurrent projectors (or duplicate deliveries) can't race — the DB only applies
+  a strictly-newer version. This is the idempotency guarantee in one line of SQL.
+
+### 5F.5 `app/adapters/memory/message_bus.py` — consumer semantics in a fake
+- `InMemoryMessageBus` tracks `_committed` (per-group offset) and `_inflight`
+  (polled-but-not-yet-committed), so a test can prove: poll returns a batch,
+  redelivers it if not committed, and only advances past it on `commit`. A
+  `published()` helper lets tests read the raw topic. This is what lets the CQRS
+  test run the full relay→projector pipeline in-process.
+
+### 5F.6 `app/projector.py` — the projector
+- `project_once` (pure/testable): `poll` a batch → `apply` each into the read
+  model → `commit(GROUP)` **only after** the whole batch is applied. If it
+  crashes mid-batch it never commits, so the next poll redelivers the same
+  batch — at-least-once, made safe by the idempotent `apply`.
+- `run_projector`: the loop (sleep when idle, survive transient errors).
+- Constants `GROUP="cqrs-projector"`, `EVENTS_TOPIC="job-events"`.
+
+### 5F.7 `app/application/job_service.py` — events carry the version
+- `_stage_event` now includes `"version": job.version` in the event payload. That
+  single field is what the read model keys LWW on — without it the projection
+  couldn't tell a new event from a redelivered old one. (This is why the write
+  side and read side stay decoupled yet consistent: the version travels *with*
+  the event, not out-of-band.)
+
+### 5F.8 `app/api/routes_read.py` + `schemas.py` — the query surface
+- A new router (`/v1`): `GET /stats` → `read_model.stats()` (counts per status),
+  and `GET /jobs/{job_id}/view` → the projected `JobViewOut`, **404** if that job
+  hasn't been projected yet (honest about eventual consistency — the write-side
+  `GET /v1/jobs/{id}` is the immediately-consistent read).
+
+### 5F.9 Wiring — worker + deps + main
+- **The worker** starts `run_projector(event_bus, read_model)` as a second
+  background task alongside the relay, so locally one process does write + relay +
+  project. (In prod the projector is its own deployable consumer — that's the
+  point of decoupling via the log.)
+- **`deps.py`** gains `get_read_model_store()` (`PostgresReadModel(get_sessionmaker())`)
+  and imports `PostgresReadModel` at module top-level so its table registers
+  before `create_all()`.
+- **`main.py`** mounts `routes_read`.
+
+> **Why this is safe under at-least-once:** the relay can publish an event twice,
+> and the projector can re-poll an uncommitted batch — both produce duplicate
+> `apply` calls. The version-keyed LWW rule makes every duplicate (and every
+> reordered older event) a **no-op**, so the read model converges to the correct
+> state no matter how many times or in what order events arrive.
+
+---
+
+## 5G. Stage 6 — multi-tenancy & identity (block-by-block)
+
+**Idea:** turn a single-user service into a **multi-tenant** platform. Three
+things have to be true: (1) every request proves *who* it is — **authentication**;
+(2) a tenant can only ever touch *its own* data — **isolation / authorization**;
+(3) a tenant's consumption is **metered and bounded** — quota. **Motive:** this is
+table-stakes for any SaaS/API product, and it's where "distributed system" meets
+"real customers": the security boundary and the fairness boundary.
+
+**The three planes, kept separate:**
+- the **tenant plane** — normal API calls, authenticated by an *API key*;
+- the **admin plane** — creating tenants/keys, authenticated by a *shared secret*
+  (`ADMIN_TOKEN`), because there's a bootstrap chicken-and-egg (no key exists yet);
+- the **system plane** — the worker, a trusted component that processes jobs
+  across all tenants (no per-request principal).
+
+### 5G.1 `app/domain/identity.py` — the identity domain
+- `Tenant` (id, name, status, `monthly_quota`), `ApiKey` (stores only
+  `secret_hash` + a displayable `prefix`, never the secret), and a **frozen**
+  `Principal` (tenant_id + key_id) — the authenticated result the routes carry.
+  Pure data + `is_active` rules; no framework, no crypto here.
+
+### 5G.2 `app/auth/keys.py` — API-key crypto hygiene
+- Keys look like `csk_<key_id>_<secret>`: the **key_id is a non-secret handle**
+  (we index rows by it → auth is one lookup, never a scan), the **secret is
+  high-entropy** and only its `sha256` is stored. `verify_secret` uses
+  `hmac.compare_digest` (constant-time). **Why sha256, not bcrypt/argon2:** slow
+  KDFs exist to protect *low-entropy human passwords*; a 24-byte random token is
+  already infeasible to brute-force, so a fast hash is the correct, standard
+  choice for API keys. Pure stdlib — trivially unit-testable.
+
+### 5G.3 `app/ports/identity_store.py` + `usage_ledger.py`
+- **`IdentityStore`**: get/add a tenant, get/add an API key (get-by-key-id is the
+  auth hot path). **`UsageLedger`**: `get_usage(tenant, period)` and
+  `record(tenant, period, n)` where `period` is the calendar month `"YYYY-MM"`.
+  Two tiny ports, each with memory + Postgres adapters.
+
+### 5G.4 Adapters — memory + Postgres
+- **Postgres identity**: `tenants` and `api_keys` tables (api_key PK = the public
+  key_id, so auth is a primary-key `get`). **Postgres usage**: one row per
+  `(tenant_id, period)`; `record` is an atomic
+  `INSERT … ON CONFLICT (tenant_id, period) DO UPDATE SET used = used + :n RETURNING used`
+  — the increment happens **inside the DB**, so two concurrent submits can't both
+  read "5" and both write "6" (the classic lost-update race).
+
+### 5G.5 Authentication — `get_principal` (in `api/deps.py`)
+- The single choke point every protected route depends on: pull the key from
+  `Authorization: Bearer …` (or `X-API-Key`), `parse` → look up by key_id →
+  `verify_secret` → check the tenant is active → return `Principal`. Every failure
+  returns the **same 401** ("invalid API key") whether the key-id is unknown, the
+  key is revoked, or the secret is wrong — so an attacker learns nothing about
+  which part was wrong. A suspended tenant is **403**.
+
+### 5G.6 Tenant isolation — threaded through the write + read models
+- `Job` gains `tenant_id`; `JobModel` gets a `tenant_id` column and the
+  idempotency uniqueness becomes **`(tenant_id, idempotency_key)`** (two tenants
+  may reuse the same key). The repository's `get`/`list`/`get_by_idempotency_key`
+  take a `tenant_id`; a **cross-tenant id reads as `None` → 404** (the id's very
+  existence is never leaked — a 404, never a 403). The staged event carries
+  `tenant_id`, so the **CQRS read model** stores it too and `/v1/stats` + `/view`
+  are per-tenant. The worker passes `tenant_id=None` (unscoped) — it's the trusted
+  system plane.
+
+### 5G.7 Quota — `JobService.submit`
+- Before doing any work: load the tenant, refuse if suspended (`Forbidden`) or if
+  `used >= monthly_quota` (`QuotaExceeded` → **429** + `Retry-After`); after
+  accepting, `record` +1 in the ledger. An **idempotent replay does NOT consume
+  quota** (it's not new work). Check-then-record isn't one atomic unit, so a
+  tenant could overshoot slightly under heavy concurrency — an accepted trade-off
+  for a coarse monthly quota (the increment itself is atomic, so counts are never
+  lost). This is a *different lever* from the Stage-4 rate limiter: that smooths
+  bursts (req/sec, system protection); this bounds volume (req/month, fairness).
+
+### 5G.8 The admin plane — `api/routes_admin.py`
+- `POST /v1/admin/tenants` creates a tenant + mints its first key (returns the
+  plaintext **once**); `POST /v1/admin/tenants/{id}/keys` mints more. The whole
+  router is gated by `require_admin` (the `ADMIN_TOKEN` shared secret). **A blank
+  `ADMIN_TOKEN` disables the admin API** (403) — a missing secret must never
+  silently mean "no auth required".
+
+> **What's deliberately deferred:** OAuth2/OIDC (JWT bearer tokens) as a *second*
+> principal source — the `get_principal` choke point is exactly where a JWT
+> verifier slots in later, returning the same `Principal`. Role-based scopes
+> (read-only vs submit keys) and key rotation/expiry are also later increments.
+
+---
+
 ## 6. Cross-cutting design decisions & trade-offs
 
 | Decision | Why | Trade-off / later fix |
@@ -669,6 +912,20 @@ agent loop is untouched — same trick as every other stage.
 | Circuit breaker per provider | fail fast when a dep is down; independent health | a flapping dep can oscillate; tune threshold/cooldown |
 | Fallback provider chain | survive one provider's outage | fallback may cost/behave differently; not always desirable |
 | Distributed (Redis+Lua) rate limit | one global limit across replicas | a Redis round-trip per request; Redis is now on the submit path |
+| Transactional outbox (Stage 5) | atomic state-change + event; no lost publishes | extra table + a relay to run; delivery is at-least-once |
+| Relay publishes-before-marks | never drops an event on a crash | duplicates possible → consumers must dedupe (idempotent) |
+| Redpanda/Kafka event backbone | durable, replayable, many independent consumers | another stateful service to operate |
+| CQRS: separate read model (Stage 5) | reads/writes optimized independently; rebuildable by replay | eventual consistency; projection code to maintain |
+| Projection idempotent via version LWW | correct under at-least-once + reordering | needs the version carried on every event |
+| LWW pushed into SQL (`WHERE version < excluded.version`) | concurrent/duplicate projectors can't race | Postgres-specific upsert (`ON CONFLICT`) |
+| Projector commits after applying a batch | a crash re-polls, never skips | a batch may be re-applied (safe: idempotent) |
+| API-key auth, keys stored **hashed** | a DB leak exposes no usable credentials | key shown once; lost = mint a new one |
+| sha256 for keys (not bcrypt/argon2) | keys are high-entropy → fast hash is safe + cheap | would be wrong for human passwords |
+| Cross-tenant access → **404, not 403** | never leak that another tenant's id exists | client can't tell "missing" from "forbidden" |
+| Tenant isolation scoped in the repository | one choke point; routes just pass `tenant_id` | every query must remember to pass it (worker opts out as trusted) |
+| Per-tenant **monthly quota** (usage ledger) | fairness/billing lever, distinct from rate limit | coarse; check+record not atomic → tiny overshoot possible |
+| Separate **admin plane** (shared secret) | solves the credential bootstrap chicken-and-egg | a second secret to manage; blank ⇒ disabled |
+| API keys now, OIDC/JWT later | ship isolation without an IdP dependency | no SSO/federation yet (slots into `get_principal`) |
 | LLM behind a port + scripted fake | tests run with no key/network/cost | one more abstraction layer |
 | Agent guardrails (token budget, max steps) | bound cost + prevent infinite loops | may stop before a hard task finishes |
 | SSE via Redis pub/sub | live progress across processes | live-only (no replay) until Stage 5-style history stream |
@@ -828,6 +1085,112 @@ rate, so the real limit would be replicas × configured. A shared Redis bucket,
 decremented atomically by a Lua script, enforces one global limit and avoids the
 race where two replicas both consume the last token.
 
+**Q: What's the dual-write problem, and how does the outbox solve it? (Stage 5)**
+Writing to the DB and publishing to the bus are two systems with no shared
+transaction — a crash between them loses the event or the write, and they
+diverge. The outbox turns the publish into a *DB write*: I insert an `outbox`
+row in the same transaction as the event, so they commit atomically. A separate
+relay then reads the outbox and publishes. Correctness (the commit) is decoupled
+from delivery (retried, best-effort).
+
+**Q: Doesn't the relay then send duplicates?**
+It can — it publishes a row, then marks it published, so a crash in between
+re-publishes on restart. That's a deliberate **at-least-once** choice (never drop
+an event). Consumers stay correct by being idempotent — deduping on the event/
+outbox id, or applying updates that are naturally idempotent (upserts).
+
+**Q: Why Kafka/Redpanda instead of just reusing Redis?**
+The backbone needs a durable, replayable log that many independent consumers
+(CQRS projector, CDC, analytics) can each read at their own offset and replay
+from history. That's exactly Kafka's model; Redpanda is a drop-in
+Kafka-compatible broker that's lighter to run locally. Redis Streams is fine for
+the work queue but isn't the multi-consumer event log this needs.
+
+**Q: What is CQRS, and why a separate read model? (Stage 5)**
+CQRS = Command Query Responsibility Segregation: the write path and the read path
+use different models. My write model (jobs + append-only job_events) is tuned for
+correctness — a state machine, optimistic concurrency, an audit log. That shape is
+bad for queries like "counts per status" or "one job's status, fast." So a
+**projector** consumes the event backbone and folds events into a denormalized
+**read model** the API serves. Each side scales and evolves independently, and the
+read model can be **rebuilt from scratch** by replaying the log — I can change its
+shape without touching the write side.
+
+**Q: The projection is fed at-least-once and events can reorder — how is it
+correct?**
+Every event carries the job's `version`, and the read model applies
+**last-writer-wins by version**: an event whose version is ≤ the stored one is a
+no-op. So a duplicate delivery and a reordered older event both change nothing,
+and the view converges to the true state regardless of delivery order or count.
+In Postgres that rule is one atomic upsert —
+`ON CONFLICT … DO UPDATE … WHERE job_read_model.version < excluded.version` —
+so even concurrent projectors can't race it.
+
+**Q: What's the consistency model, then?**
+The write side is immediately consistent (`GET /v1/jobs/{id}` reads it directly).
+The read model is **eventually consistent** — after a commit it takes a relay hop
+plus a projector hop to update, so `/v1/jobs/{id}/view` may 404 for a moment right
+after submit. That's the deliberate CQRS trade-off: you accept a small lag on the
+query side in exchange for independently optimized, replayable reads.
+
+**Q: How does the projector track its position, and what happens on a crash?**
+It's a Kafka-style consumer group (`cqrs-projector`) with its own committed
+offset. It applies a whole polled batch, *then* commits. Crash mid-batch → no
+commit → the next poll redelivers that batch → the idempotent `apply` makes the
+re-processing harmless. It never skips (commit-after-apply) and never corrupts
+(version LWW).
+
+**Q: How do you authenticate requests, and how are the keys stored? (Stage 6)**
+Clients send an API key as `Authorization: Bearer csk_<id>_<secret>`. I store
+only a **sha256 hash** of the secret half, plus a non-secret `key_id` I index by —
+so auth is a single indexed lookup, and a database leak exposes hashes, not usable
+keys. On each request I hash the presented secret and compare in **constant time**
+(`hmac.compare_digest`). The key is shown to the user exactly once at creation.
+
+**Q: Why sha256 and not bcrypt/argon2?**
+Those slow KDFs exist to make *low-entropy human passwords* expensive to
+brute-force. An API key's secret is 24+ random bytes — already infeasible to
+guess — so a fast hash is the correct, standard choice for tokens. If I were
+storing user passwords, I'd use argon2id instead.
+
+**Q: How do you enforce tenant isolation — what stops tenant A reading tenant B's
+job?**
+Every job carries a `tenant_id`, and the repository scopes reads by it: `get(id,
+tenant_id)` returns the row only if it belongs to that tenant, otherwise `None`.
+The route turns `None` into a **404** — deliberately *not* a 403 — so I never even
+leak that another tenant's id exists. Lists, the event log, cancel, and the CQRS
+`/stats` and `/view` are all scoped the same way. The check lives in one place
+(the repository), so routes can't forget it.
+
+**Q: Why 404 rather than 403 for another tenant's resource?**
+A 403 confirms "this id exists, you just can't have it" — an information leak
+(enumeration). A 404 is indistinguishable from a genuinely missing id, so an
+attacker probing ids learns nothing. Same reason auth returns one generic 401 for
+unknown-key vs wrong-secret.
+
+**Q: You have a Stage-4 rate limiter AND a Stage-6 quota — aren't those the same?**
+No — different axes. The rate limiter smooths **bursts** (requests/second, global
+across replicas via Redis) to protect the *system* from overload; it's stateless
+about who you are. The quota bounds **volume over time** (submissions/month, per
+tenant, via the usage ledger) — a *fairness/billing* lever. A tenant can be well
+under the per-second limit yet out of monthly quota, or vice-versa; a submit must
+pass both.
+
+**Q: How is the usage count kept correct under concurrency?**
+The Postgres ledger increments inside the database:
+`INSERT … ON CONFLICT (tenant_id, period) DO UPDATE SET used = used + 1 RETURNING used`.
+That serialises concurrent submits for a tenant, so no count is lost. The
+quota *check* and the *record* aren't one transaction, so a burst could overshoot
+the limit by a hair — an accepted trade-off for a coarse monthly quota; the counts
+themselves are never wrong.
+
+**Q: Where do the first credentials come from — isn't there a bootstrap problem?**
+Yes: you need a key to call the platform, but no key exists yet. So there's a
+separate **admin plane** — `POST /v1/admin/tenants` — authenticated by a shared
+`ADMIN_TOKEN` (env), not by an API key. It creates a tenant and mints its first
+key. If `ADMIN_TOKEN` is unset the admin API is **disabled** (403), never open —
+a missing secret must not mean "no auth".
+
 ## 8. Known gaps and what later stages fix
 - **MongoDB trajectories + Redis hot state** (polyglot) → **Stage 2**. ✅ done
 - **Multi-store consistency** (Mongo+Postgres+Redis not atomic) → transactional **outbox + CDC**, **Stage 5**.
@@ -838,7 +1201,15 @@ race where two replicas both consume the last token.
 - **SSE trajectory replay** (not just live) → Stage 5-style history stream.
 - **Retries/backoff/circuit breaker/fallback + rate-limit/load-shed** → **Stage 4**. ✅ done
 - **Provider-side call throttling** (reuse the token bucket to respect provider limits) — small follow-on to Stage 4.
-- **Kafka backbone, CQRS read models, CDC + transactional outbox** → **Stage 5**.
+- **Transactional outbox + Kafka/Redpanda backbone** (for the event stream) → **Stage 5 part 1**. ✅ done
+- **CQRS read model** (projector + `/v1/stats` + `/v1/jobs/{id}/view`, version-LWW idempotent) → **Stage 5 part 2**. ✅ done
+- **Saga, CDC, schema registry** → **Stage 5 parts 3+** (optional later increments).
+- **Outbox for job *dispatch*** (replace the direct Redis enqueue) → same pattern, a small follow-on.
+- **Read model is eventually consistent** — `/view` can briefly 404 after submit; a client wanting strong reads uses the write-side `GET /v1/jobs/{id}`.
+- **Multi-tenancy: API-key auth, tenant isolation, per-tenant quota + usage ledger, admin bootstrap** → **Stage 6**. ✅ done
+- **OAuth2/OIDC (JWT) as a second principal source**, **scoped keys** (read-only vs submit), **key rotation/expiry** → later increments (slot into `get_principal`).
+- **Per-tenant rate limits** (reuse the Stage-4 bucket keyed by tenant) → small follow-on.
+- **Quota check + usage record aren't atomic** (tiny overshoot under bursts) → acceptable for a coarse monthly quota; a stricter limit would reserve-then-commit.
 
 ## 9. Glossary
 - **Accept-fast / 202+id** — return an id immediately, process later.
@@ -851,3 +1222,16 @@ race where two replicas both consume the last token.
 - **Port / adapter** — an interface the app depends on / its concrete impl.
 - **Cooperative cancellation** — the worker checks for "stop" at safe points.
 - **Correlation id** — a per-request id threaded through logs for tracing.
+- **CQRS** — Command Query Responsibility Segregation: separate write and read models.
+- **Read model / projection** — a denormalized view built by folding events, tuned for queries.
+- **Projector** — the consumer that folds events into the read model.
+- **Last-writer-wins (LWW)** — resolve conflicts by keeping the highest version; makes projection idempotent.
+- **Eventual consistency** — the read model catches up to the write side after a short delay.
+- **Consumer group / offset** — a Kafka consumer's independent, committed position in the log.
+- **Multi-tenancy** — many isolated customers (tenants) on one shared deployment.
+- **Tenant** — the unit of isolation, billing, and quota; every job belongs to one.
+- **Principal** — the authenticated identity of a request (here: tenant + key id).
+- **API key** — a bearer credential; stored hashed, presented as `csk_<id>_<secret>`.
+- **Authentication vs authorization** — *who you are* (the key → principal) vs *what you may touch* (tenant-scoped queries).
+- **Quota** — a per-tenant volume allowance over a period (here monthly submissions), tracked by the usage ledger.
+- **Admin plane** — the separate, shared-secret-guarded surface that mints tenants/keys.
