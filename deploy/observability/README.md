@@ -67,31 +67,40 @@ and it appears in **Alertmanager** (:9093). Turn it back off:
 export CHAOS_ENABLED=false CHAOS_FAULT_RATE=0.0 && docker compose up -d gateway
 ```
 
-### Slack notifications (real delivery)
+### Slack notifications (real delivery), routed by severity
 
-Alertmanager routes firing alerts to Slack via `slack_configs`. The webhook URL
-is a secret, kept in `alertmanager/slack_api_url` (referenced by `api_url_file`),
-not inlined in the config.
+Alerts route to **two** Slack receivers by `severity` label:
 
-1. Create a Slack **Incoming Webhook**: Slack → Apps → *Incoming Webhooks* → add
-   to a channel → copy the `https://hooks.slack.com/services/...` URL.
-2. Put it in the file (replace the placeholder):
+| Route | Alerts | Receiver → channel | Behaviour |
+|---|---|---|---|
+| `severity="page"` | `HighErrorRate`, `GatewayDown` | `slack-page` → `#cosmos-pages` | notify immediately (`group_wait: 0s`), re-send every 30m |
+| default (everything else) | `HighLatencyP95`, … | `slack` → `#cosmos-alerts` | standard cadence |
+
+Each receiver reads its webhook from a secret file (`api_url_file`), so nothing
+sensitive is inlined:
+
+1. Create **two** Slack Incoming Webhooks (one per channel): Slack → Apps →
+   *Incoming Webhooks* → add to `#cosmos-alerts` and to `#cosmos-pages` → copy each
+   `https://hooks.slack.com/services/...` URL.
+2. Put them in the two files (replace the placeholders) and keep them out of git:
    ```bash
-   printf 'https://hooks.slack.com/services/XXX/YYY/ZZZ\n' > deploy/observability/alertmanager/slack_api_url
-   # keep your real webhook OUT of git:
-   git update-index --skip-worktree deploy/observability/alertmanager/slack_api_url
+   cd deploy/observability/alertmanager
+   printf 'https://hooks.slack.com/services/XXX/YYY/ZZZ\n' > slack_api_url        # #cosmos-alerts
+   printf 'https://hooks.slack.com/services/AAA/BBB/CCC\n' > slack_api_url_page   # #cosmos-pages
+   git update-index --skip-worktree slack_api_url slack_api_url_page
    ```
-3. Restart Alertmanager and fire an alert:
+   > Only have one channel/webhook? Point both files at the same URL — routing
+   > still works, both just land in one channel.
+3. Restart Alertmanager and fire a **page** (HighErrorRate is `severity=page`):
    ```bash
    cd deploy/observability && docker compose -f docker-compose.observability.yaml up -d alertmanager
-   # trigger HighErrorRate via chaos (above) -> a message posts to your channel,
-   # and a "RESOLVED" follow-up when you turn chaos off (send_resolved: true).
+   # trigger via chaos -> posts to #cosmos-pages, with a RESOLVED follow-up when it clears
    ```
 
-> Until you set a real URL, Alertmanager still starts and shows alerts in its UI —
-> it just gets a 404 posting to the placeholder (harmless, logged). Set the channel
-> in `alertmanager.yml` only if you use a Slack *app* token; incoming webhooks post
-> to the channel the hook was created for.
+> Until you set real URLs, Alertmanager still starts and shows alerts in its UI —
+> it just 404s posting to the placeholders (harmless, logged). The `channel:` field
+> matters only for Slack *app* tokens; incoming webhooks post to the channel the
+> hook was created for.
 
 ## Tear down
 ```bash
