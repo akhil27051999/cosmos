@@ -42,7 +42,7 @@ class ProcessResult(str, Enum):
 
 
 async def process_job(
-    job_id: uuid.UUID, *, repo: JobRepository, events: EventStore, work_fn, cache=None
+    job_id: uuid.UUID, *, repo: JobRepository, events: EventStore, work_fn, cache=None, outbox=None
 ) -> ProcessResult:
     """Handle exactly one delivered job id. Safe to call more than once."""
     job = await repo.get(job_id)
@@ -56,7 +56,9 @@ async def process_job(
 
     # Pass the cache so the worker's own transitions invalidate it too — else an
     # API read could serve a stale status after the worker advances the job.
-    service = JobService(repo, events, cache=cache)
+    # Pass the outbox so started/succeeded/failed events are staged for the bus
+    # in the same transaction as the event append.
+    service = JobService(repo, events, cache=cache, outbox=outbox)
 
     # Only PENDING jobs get "started". A RUNNING job here means a redelivery
     # after a crash mid-run, so we skip the (illegal) RUNNING->RUNNING move and
@@ -161,10 +163,15 @@ async def run_worker() -> None:
     from app.adapters.postgres.event_store import PostgresEventStore
     from app.adapters.postgres.repository import PostgresJobRepository
     from app.adapters.redis.cache import RedisJobCache
+    from app.adapters.postgres.outbox import PostgresOutbox, PostgresOutboxRelay
+    from app.adapters.postgres.read_model import PostgresReadModel
     from app.adapters.redis.queue import RedisJobQueue
     from app.adapters.redis.stream_bus import RedisStreamBus
+    from app.adapters.redpanda.message_bus import RedpandaMessageBus
     from app.core.config import get_settings
     from app.core.db import create_all, get_sessionmaker
+    from app.projector import run_projector
+    from app.relay import run_relay
 
     settings = get_settings()
     await create_all()  # ensure tables exist if the worker starts before the API
@@ -207,6 +214,19 @@ async def run_worker() -> None:
     bus = RedisStreamBus(redis)
 
     sessionmaker = get_sessionmaker()
+
+    # Stage 5: the outbox relay drains committed outbox rows to the event
+    # backbone (Redpanda) in the background, alongside the job loop. In prod this
+    # would be its own deployable; co-locating it here keeps local dev simple.
+    event_bus = RedpandaMessageBus(settings.redpanda_brokers)
+    outbox_relay = PostgresOutboxRelay(sessionmaker)
+    asyncio.create_task(run_relay(outbox_relay, event_bus))
+
+    # Stage 5 part 2: the CQRS projector consumes job-events and builds the
+    # denormalized read model. Another background task (its own deployable in prod).
+    read_model = PostgresReadModel(sessionmaker)
+    asyncio.create_task(run_projector(event_bus, read_model))
+
     print(f"[worker] started as '{consumer_name}', waiting for jobs...")
 
     # On startup, reclaim anything a previous worker left pending (crash recovery).
@@ -219,6 +239,7 @@ async def run_worker() -> None:
             async with sessionmaker() as session:
                 repo = PostgresJobRepository(session)
                 events = PostgresEventStore(session)
+                outbox = PostgresOutbox(session)   # staged events commit with the tx
                 try:
                     result = await process_job(
                         msg.job_id,
@@ -226,6 +247,7 @@ async def run_worker() -> None:
                         events=events,
                         work_fn=_make_agent_work_fn(repo, docs, bus, llm, settings),
                         cache=cache,
+                        outbox=outbox,
                     )
                     await session.commit()
                 except Exception as exc:  # noqa: BLE001
