@@ -1,0 +1,71 @@
+{{- if .Values.backingServices.enabled }}
+{{- $fn := include "cosmos.fullname" . -}}
+{{- $pg := .Values.backingServices.postgres -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $fn }}-postgres
+  labels:
+    {{- include "cosmos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ $pg.storage }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fn }}-postgres
+  labels:
+    {{- include "cosmos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate        # a single PVC can't be attached to two pods at once
+  selector:
+    matchLabels:
+      {{- include "cosmos.selectorLabels" (dict "ctx" . "component" "postgres") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cosmos.selectorLabels" (dict "ctx" . "component" "postgres") | nindent 8 }}
+    spec:
+      containers:
+        - name: postgres
+          image: {{ $pg.image }}
+          env:
+            - { name: POSTGRES_USER, value: {{ $pg.user | quote }} }
+            - { name: POSTGRES_PASSWORD, value: {{ $pg.password | quote }} }
+            - { name: POSTGRES_DB, value: {{ $pg.db | quote }} }
+            # Store data in a subdir so the volume's lost+found doesn't clash.
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ $pg.user | quote }}, "-d", {{ $pg.db | quote }}]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ $fn }}-postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fn }}-postgres
+  labels:
+    {{- include "cosmos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  selector:
+    {{- include "cosmos.selectorLabels" (dict "ctx" . "component" "postgres") | nindent 4 }}
+  ports:
+    - { name: postgres, port: 5432, targetPort: postgres }
+{{- end }}

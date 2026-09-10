@@ -1,0 +1,21 @@
+Cosmos deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Gateway service:  {{ include "cosmos.fullname" . }}-gateway:{{ .Values.gateway.service.port }}
+Worker gRPC:      {{ include "cosmos.fullname" . }}-worker:{{ .Values.config.workerGrpcPort }}
+
+1) Watch everything come up:
+     kubectl -n {{ .Release.Namespace }} get pods -w
+
+2) Port-forward the gateway and hit it:
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "cosmos.fullname" . }}-gateway 8000:{{ .Values.gateway.service.port }}
+     curl -s localhost:8000/healthz
+
+{{- if .Values.secrets.create }}
+{{- if eq .Values.secrets.adminToken "change-me-admin-token" }}
+
+WARNING: you are using the default ADMIN_TOKEN. Override it:
+     helm upgrade {{ .Release.Name }} <chart> --set secrets.adminToken=$(openssl rand -hex 16)
+{{- end }}
+{{- end }}
+
+3) Create a tenant (admin plane) and submit a job — see docs/STAGES.md (Stage 8).

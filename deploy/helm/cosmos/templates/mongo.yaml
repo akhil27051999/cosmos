@@ -1,0 +1,65 @@
+{{- if .Values.backingServices.enabled }}
+{{- $fn := include "cosmos.fullname" . -}}
+{{- $mongo := .Values.backingServices.mongo -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $fn }}-mongo
+  labels:
+    {{- include "cosmos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mongo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ $mongo.storage }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fn }}-mongo
+  labels:
+    {{- include "cosmos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mongo
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "cosmos.selectorLabels" (dict "ctx" . "component" "mongo") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cosmos.selectorLabels" (dict "ctx" . "component" "mongo") | nindent 8 }}
+    spec:
+      containers:
+        - name: mongo
+          image: {{ $mongo.image }}
+          ports:
+            - { name: mongo, containerPort: 27017 }
+          readinessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - { name: data, mountPath: /data/db }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ $fn }}-mongo
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fn }}-mongo
+  labels:
+    {{- include "cosmos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mongo
+spec:
+  selector:
+    {{- include "cosmos.selectorLabels" (dict "ctx" . "component" "mongo") | nindent 4 }}
+  ports:
+    - { name: mongo, port: 27017, targetPort: mongo }
+{{- end }}

@@ -1,0 +1,50 @@
+{{- if .Values.backingServices.enabled }}
+{{- $fn := include "cosmos.fullname" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fn }}-redpanda
+  labels:
+    {{- include "cosmos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redpanda
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "cosmos.selectorLabels" (dict "ctx" . "component" "redpanda") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cosmos.selectorLabels" (dict "ctx" . "component" "redpanda") | nindent 8 }}
+    spec:
+      containers:
+        - name: redpanda
+          image: {{ .Values.backingServices.redpanda.image }}
+          args:
+            - redpanda
+            - start
+            - --mode=dev-container       # single-node sane defaults for dev
+            - --smp=1
+            - --kafka-addr=internal://0.0.0.0:9092
+            - --advertise-kafka-addr=internal://{{ $fn }}-redpanda:9092
+          ports:
+            - { name: kafka, containerPort: 9092 }
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "rpk cluster health | grep -qE 'Healthy:.+true'"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fn }}-redpanda
+  labels:
+    {{- include "cosmos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redpanda
+spec:
+  selector:
+    {{- include "cosmos.selectorLabels" (dict "ctx" . "component" "redpanda") | nindent 4 }}
+  ports:
+    - { name: kafka, port: 9092, targetPort: kafka }
+{{- end }}
