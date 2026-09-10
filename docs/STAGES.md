@@ -1024,7 +1024,75 @@ docker compose exec postgres psql -U cosmos -d cosmos -c "SELECT id,name FROM te
 
 ---
 
-## Stage 12 — capstone: resilience & release (SLOs, load test, chaos) ⬜ (next)
+## Stage 12 — capstone: reliability & release ✅
 
-The final stage — tie it together with SLOs, a load test, and a graceful-shutdown
-/ chaos pass. Steps appended when it lands.
+**What it adds:** the SRE loop — define objectives, measure them, and prove the
+system behaves under failure and shutdown.
+
+- **SLOs + error budgets** (`app/observability/slo.py`, `GET /v1/admin/slo`): availability (non-5xx / total) and latency (fraction under a threshold) computed from the Stage-10 metrics, each with **error budget remaining** vs a configured target.
+- **Graceful shutdown**: on shutdown the app enters **draining** (`/readyz` → 503 *without* touching the DB, so k8s stops routing while in-flight requests finish) and disposes the DB pool. The **worker** installs SIGTERM/SIGINT handlers and finishes (and acks) the current job before exiting — nothing dropped.
+- **Chaos injection** (`app/observability/chaos.py`): a config-gated, **off-by-default** middleware that adds latency and/or fails a fraction of requests — injected *inside* the metrics layer so faults burn the SLO budget (watch `/slo` react).
+- **Load test** (`scripts/loadtest.py`): a dependency-light async generator reporting throughput + p50/p95/p99 + status split.
+
+### Test steps
+
+**A. Automated**
+```bash
+cd services/gateway && source .venv/bin/activate && pytest -q
+```
+Expect **108 passed** (adds 7: SLO endpoint shape + admin-gate; availability & budget react to 5xx; the budget-remaining math; `/readyz` reports `draining` without a DB hit; chaos injects a 503 that's recorded in metrics; chaos off by default).
+
+**B. End-to-end (Docker) — run the reliability loop**
+```bash
+cd services/gateway
+export ADMIN_TOKEN=dev-admin-secret
+docker compose up -d --build
+until curl -sf localhost:8000/healthz >/dev/null; do sleep 1; done; echo ready
+
+# Baseline SLO (healthy):
+curl -s localhost:8000/v1/admin/slo -H "X-Admin-Token: $ADMIN_TOKEN" | python3 -m json.tool
+# -> availability.actual ~1.0, error_budget_remaining ~1.0
+
+# Turn on chaos (fail 30% of requests) and generate traffic:
+export CHAOS_ENABLED=true CHAOS_FAULT_RATE=0.3
+docker compose up -d            # env-only change, no --build
+for i in $(seq 1 50); do curl -s -o /dev/null localhost:8000/healthz; done
+curl -s localhost:8000/v1/admin/slo -H "X-Admin-Token: $ADMIN_TOKEN" | python3 -m json.tool
+# -> availability.actual < 1.0, error_budget_remaining has DROPPED (budget burning)
+
+# Turn chaos back off:
+export CHAOS_ENABLED=false && docker compose up -d
+```
+
+**C. Load test** (create a tenant key first — Stage 6):
+```bash
+python scripts/loadtest.py --url http://localhost:8000 --key "$KEY" --n 500 --concurrency 50
+# prints throughput + p50/p95/p99 + status split; compare against /v1/admin/slo
+```
+
+**D. Graceful shutdown**
+```bash
+docker compose stop gateway      # sends SIGTERM
+docker compose logs --tail=5 worker   # on worker stop you'll see "drained; shutting down cleanly"
+```
+
+**What to verify (learning checkpoints):**
+- `/slo` availability + budget move the moment you inject chaos, and recover after (over the process lifetime window).
+- While draining, `/readyz` is 503 `draining` but `/healthz` stays 200 — liveness vs readiness doing their distinct jobs.
+- The worker finishes its current job before exiting on SIGTERM (no half-done job; unacked messages redeliver).
+
+### Troubleshooting
+
+| Symptom | Cause & fix |
+|---|---|
+| `/slo` availability stuck at 1.0 after enabling chaos | No traffic since enabling, or `CHAOS_ENABLED` didn't apply. Generate requests; confirm `CHAOS_ENABLED=true` and re-run `docker compose up -d` (env-only). |
+| Chaos still firing after you disabled it | Set `CHAOS_ENABLED=false` **and** `docker compose up -d` to re-read env; chaos state is per-process. |
+| Error budget never recovers | The window is process-lifetime (cumulative), not a rolling window — a restart resets it. A time-windowed SLO (Prometheus `rate()` over 30d) is the production version; noted as a follow-on. |
+| `/readyz` 503 `draining` unexpectedly | The process is shutting down. If it's stuck, the pod is mid-termination; a fresh pod reports ready. |
+| Load test all 401 | Wrong/missing `--key`; mint one via the admin API (Stage 6). |
+
+---
+
+*Stage 12 completes the 12-stage build.* Future hardening — distributed tracing
+(OTel), a time-windowed SLO, CDC, a Go worker + service mesh, preview
+environments, and multi-region — is catalogued in `ENGINEERING-NOTES.md §8`.

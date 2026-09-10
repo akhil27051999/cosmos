@@ -43,7 +43,9 @@ As later stages arrive, `services/` grows (e.g. a `worker/`), and a top-level
 | **9** | **A/B experimentation & feature flags**: deterministic, sticky, weighted variant assignment (hash-based, no stored state); exposure tracking; admin-managed experiments; `/v1/experiments/{key}/assignment` + `/results`. | ✅ built |
 | **10** | **Observability & SRE**: structured JSON logs with correlation IDs, **RED metrics** middleware (rate/errors/duration by route template), a Prometheus `/metrics` endpoint (dependency-free exposition-format registry). | ✅ built |
 | **11** | **Saga / distributed transactions**: a saga orchestrator (forward steps + **compensations in reverse** on failure, persisted for crash-recovery), applied to a **tenant-onboarding** workflow spanning identity + experiments. | ✅ built |
-| … | Go worker + mesh → CDC → preview envs → cloud/multi-region | ⬜ |
+| **12** | **Capstone — reliability & release**: **SLOs + error budgets** (`/v1/admin/slo`) computed from the metrics, **graceful shutdown** (draining readiness + pool disposal; worker finishes in-flight on SIGTERM), **chaos** fault injection, and an async **load-test** script. | ✅ built |
+
+**All 12 stages built.** Later hardening (Go worker + service mesh, CDC, distributed tracing, preview envs, multi-region) is noted in `docs/ENGINEERING-NOTES.md §8`.
 
 ## Quick start (Stage 0)
 

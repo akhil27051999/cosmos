@@ -29,6 +29,7 @@
 5L. **Stage 9** — A/B experimentation & feature flags (block-by-block)
 5M. **Stage 10** — observability & SRE (block-by-block)
 5N. **Stage 11** — Saga / distributed transactions (block-by-block)
+5O. **Stage 12** — capstone: reliability & release (block-by-block)
 6. Cross-cutting design decisions & trade-offs
 7. Interview Q&A — what / why / how
 8. Known gaps and what later stages fix
@@ -1351,6 +1352,56 @@ what lets you resume forward or finish compensating instead of losing track.
 
 ---
 
+## 5O. Stage 12 — capstone: reliability & release (block-by-block)
+
+**Idea:** close the loop an SRE lives in — **define** objectives, **measure**
+them, **survive** failure and shutdown, and **prove** it under load. Nothing new
+in the business domain; this is the operability capstone tying Stage-10 metrics
+into the numbers and behaviors that gate a release.
+
+### 5O.1 `app/observability/slo.py` — SLOs & error budgets
+- Computes two SLIs from the metrics already collected: **availability** (non-5xx
+  / total — 4xx are *client* errors, excluded, because a bad request isn't the
+  service failing) and **latency** (fraction of requests under a threshold, read
+  from the duration histogram's cumulative buckets — the same data as a p95). For
+  each, the **error budget remaining**: if the target is 99%, you're allowed 1%
+  failures; `remaining = 1 - consumed/allowed`, clamped. Burning the budget is
+  what freezes releases in SRE practice. Pure function over the registry →
+  unit-tested by driving requests. `GET /v1/admin/slo` serves the report.
+
+### 5O.2 `app/core/lifecycle.py` + `/readyz` — graceful shutdown
+- A `draining` flag. On shutdown the app **begins draining** and disposes the DB
+  pool; `/readyz` checks the flag **first and returns 503 without touching the
+  DB**, so Kubernetes pulls the pod from the Service while in-flight requests
+  finish (SIGTERM → drain window → SIGKILL). Liveness (`/healthz`) stays 200 the
+  whole time — we're alive, just not accepting new traffic. This is the concrete
+  payoff of the Stage-0 liveness-vs-readiness split.
+
+### 5O.3 The worker's graceful shutdown
+- `run_worker` installs SIGTERM/SIGINT handlers that set an `asyncio.Event`; the
+  loop checks it and exits **after finishing and acking the current job**. Because
+  ack-after-commit is already the rule, anything not acked at shutdown is safely
+  redelivered to the next worker — no job dropped mid-flight.
+
+### 5O.4 `app/observability/chaos.py` — fault injection
+- A pure-ASGI middleware that, when explicitly enabled, adds latency and/or fails
+  a configured fraction of requests. **Off by default** (you never inject faults
+  in prod unless it's a game day). Crucially it sits *inside* the metrics
+  middleware, so an injected 503 is recorded in `http_requests_total` and **burns
+  the SLO budget** — letting you demonstrate the whole loop: inject → availability
+  drops → `/slo` shows budget falling → (in a real system) an alert fires.
+
+### 5O.5 `scripts/loadtest.py` — the client-side view
+- A dependency-light asyncio+httpx generator: N submits at a concurrency, reports
+  throughput and p50/p95/p99 and the status split — the numbers you compare
+  against the server's `/slo` to see if you're meeting objectives under load.
+
+> **What a production SLO adds:** a **time-windowed** SLI (Prometheus `rate()`
+> over 30 days) rather than this process-lifetime cumulative, plus burn-rate
+> alerts. The math and the endpoint are the same shape; only the window differs.
+
+---
+
 ## 6. Cross-cutting design decisions & trade-offs
 
 | Decision | Why | Trade-off / later fix |
@@ -1425,6 +1476,11 @@ what lets you resume forward or finish compensating instead of losing track.
 | Persist after every step | crash-recoverable + resumable | a save per transition (more writes) |
 | Compensation failure → FAILED (stop) | surfaces partial state for a human | not auto-healed; needs manual repair |
 | Idempotent actions/compensations | safe to resume / retry | each op must be written that way |
+| SLOs computed from existing metrics | no new pipeline; error budget is measurable | process-lifetime window (not rolling) until prod |
+| 4xx excluded from availability SLI | a bad request isn't the service failing | you must watch 4xx separately |
+| Draining readiness on shutdown | k8s stops routing before the pod dies (no dropped reqs) | needs the readiness check to bypass the DB |
+| Worker finishes current job on SIGTERM | no half-done work; unacked → redelivered | shutdown waits up to one job |
+| Chaos off by default, inside metrics | safe; injected faults burn the real budget | it's coarse (rate/latency), not scenario-based |
 | LLM behind a port + scripted fake | tests run with no key/network/cost | one more abstraction layer |
 | Agent guardrails (token budget, max steps) | bound cost + prevent infinite loops | may stop before a hard task finishes |
 | SSE via Redis pub/sub | live progress across processes | live-only (no replay) until Stage 5-style history stream |
@@ -1887,6 +1943,32 @@ pretending it unwound. That's the one case a human (or an alert) must handle,
 because the world is partially rolled back; everything up to that point is
 already undone.
 
+**Q: What are your SLOs and how do you track the error budget? (Stage 12)**
+Two SLIs from the metrics: availability (non-5xx / total) and latency (fraction
+of requests under a threshold, from the histogram). Each has a target (99% /
+95%), and the **error budget** is the flip side — a 99% target allows 1% failure,
+and `error_budget_remaining` says how much of that is left. `GET /v1/admin/slo`
+computes it live. In SRE practice you stop shipping features and focus on
+reliability when the budget is exhausted — and the chaos injector lets you watch
+the budget burn on demand.
+
+**Q: How do you shut down without dropping requests?**
+Graceful drain. On SIGTERM the app enters a draining state: `/readyz` immediately
+returns 503 (without even hitting the DB), so Kubernetes removes the pod from the
+Service and stops sending new requests, while in-flight ones finish and the DB
+pool is disposed. Liveness stays green so k8s doesn't *restart* a pod that's
+intentionally shutting down. The worker does the analogue: it catches SIGTERM,
+finishes and acks the current job, then exits — and because ack happens only
+after commit, anything unacked is redelivered, never lost.
+
+**Q: Why build a chaos injector, and why is it safe?**
+Chaos engineering proves your resilience works by injecting controlled failure —
+otherwise you only find out during a real incident. Mine adds latency / failures
+for a fraction of requests, is **off by default** (enabled only for a game day),
+and injects *inside* the metrics layer so the faults are measured and burn the SLO
+budget — turning "does our alerting/observability actually catch this?" into a
+button you can press.
+
 ## 8. Known gaps and what later stages fix
 - **MongoDB trajectories + Redis hot state** (polyglot) → **Stage 2**. ✅ done
 - **Multi-store consistency** (Mongo+Postgres+Redis not atomic) → transactional **outbox + CDC**, **Stage 5**.
@@ -1919,6 +2001,8 @@ already undone.
 - **Saga / compensating transactions** for multi-step workflows (+ tenant teardown via idempotent deletes) → **Stage 11**. ✅ done
 - **Saga resume endpoint + async execution** (the engine already supports resume) → small follow-on.
 - **CDC** (change-data-capture off the DB WAL as an alternative to the outbox) → later increment.
+- **Capstone: SLOs/error budgets, graceful shutdown/draining, chaos injection, load test** → **Stage 12**. ✅ done
+- **Time-windowed SLOs + burn-rate alerts** (rolling window via Prometheus `rate()`), scenario-based chaos, and a hosted dashboard → production hardening beyond the 12-stage build.
 - **Per-tenant rate limits** (reuse the Stage-4 bucket keyed by tenant) → small follow-on.
 - **Quota check + usage record aren't atomic** (tiny overshoot under bursts) → acceptable for a coarse monthly quota; a stricter limit would reserve-then-commit.
 
@@ -1984,3 +2068,7 @@ already undone.
 - **compensation / compensating action** — the inverse of a step, run to undo it when a later step fails.
 - **orchestration (vs choreography)** — a central coordinator drives the steps (here) vs each service reacting to events.
 - **two-phase commit (2PC)** — a locking distributed-transaction protocol the saga pattern avoids.
+- **SLI / SLO / error budget** — an indicator (measured) / an objective (target) / the tolerated shortfall (1 − target), and how much is left.
+- **graceful shutdown / draining** — stop taking new traffic (readiness 503) and let in-flight work finish before exiting.
+- **chaos engineering** — injecting controlled failure to prove resilience and observability actually work.
+- **game day** — a planned exercise where you deliberately break things (e.g. turn chaos on) to test the system + the team.
