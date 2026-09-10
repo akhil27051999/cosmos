@@ -24,6 +24,7 @@ from app.domain.exceptions import (
     InvalidTransition,
     JobNotFound,
     QuotaExceeded,
+    ServiceUnavailable,
     Unauthenticated,
     VersionConflict,
 )
@@ -52,6 +53,7 @@ _DOMAIN_MAP: dict[type[DomainError], tuple[int, str]] = {
     Unauthenticated: (401, "unauthenticated"),
     Forbidden: (403, "forbidden"),
     QuotaExceeded: (429, "quota_exceeded"),
+    ServiceUnavailable: (503, "service_unavailable"),
 }
 
 

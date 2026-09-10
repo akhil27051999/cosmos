@@ -39,6 +39,7 @@ from app.ports.job_repository import JobRepository
 from app.ports.outbox import OutboxWriter
 from app.ports.read_model import ReadModelStore
 from app.ports.usage_ledger import UsageLedger
+from app.ports.worker_control import WorkerControlClient
 from app.resilience.rate_limiter import RateLimiter
 from app.ports.stream_bus import StreamBus
 
@@ -285,6 +286,24 @@ def get_stream_bus() -> StreamBus:
     from app.adapters.redis.stream_bus import RedisStreamBus  # lazy import
 
     return RedisStreamBus(_get_redis())
+
+
+@lru_cache
+def _get_worker_control():
+    """One gRPC client to the worker's control plane, per process (lazy).
+
+    Lazy import keeps grpc out of the test path — tests override
+    `get_worker_control` with the in-memory fake.
+    """
+    from app.adapters.grpc.worker_control import GrpcWorkerControlClient  # lazy
+
+    from app.core.config import get_settings
+
+    return GrpcWorkerControlClient(get_settings().worker_grpc_target)
+
+
+def get_worker_control() -> WorkerControlClient:
+    return _get_worker_control()
 
 
 def get_job_service(

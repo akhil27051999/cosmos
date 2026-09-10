@@ -127,3 +127,20 @@ class TenantCreated(BaseModel):
     monthly_quota: int
     key_prefix: str
     api_key: str = Field(..., description="the full secret — store it now; shown only once")
+
+
+class WorkerStatusOut(BaseModel):
+    """A worker's control-plane status (GET /v1/admin/worker/status), fetched
+    from the worker over gRPC (Stage 7 part 2)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    worker_id: str
+    uptime_seconds: float
+    in_flight: int
+    processed_total: int
+    healthy: bool
+
+    @classmethod
+    def from_entity(cls, status) -> "WorkerStatusOut":
+        return cls.model_validate(status)

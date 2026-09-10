@@ -21,13 +21,14 @@ import secrets
 
 from fastapi import APIRouter, Depends, status
 
-from app.api.deps import get_identity_store, require_admin
-from app.api.schemas import ApiKeyCreated, TenantCreate, TenantCreated
+from app.api.deps import get_identity_store, get_worker_control, require_admin
+from app.api.schemas import ApiKeyCreated, TenantCreate, TenantCreated, WorkerStatusOut
 from app.auth.keys import generate_api_key
 from app.core.config import get_settings
-from app.domain.exceptions import JobNotFound
+from app.domain.exceptions import JobNotFound, ServiceUnavailable
 from app.domain.identity import Tenant
 from app.ports.identity_store import IdentityStore
+from app.ports.worker_control import WorkerControlClient
 
 # `dependencies=[require_admin]` gates EVERY route on this router — none of them
 # is reachable without a valid admin token.
@@ -71,3 +72,17 @@ async def create_key(
     plaintext, key = generate_api_key(tenant_id)
     await identity.add_api_key(key)
     return ApiKeyCreated(tenant_id=tenant_id, key_prefix=key.prefix, api_key=plaintext)
+
+
+@router.get("/worker/status", response_model=WorkerStatusOut)
+async def worker_status(
+    client: WorkerControlClient = Depends(get_worker_control),
+) -> WorkerStatusOut:
+    # Operational, cross-tenant info -> lives on the admin plane. The gateway
+    # calls the worker synchronously over gRPC (the control plane). If the worker
+    # is unreachable, surface a clean 503 rather than a 500.
+    try:
+        status = await client.get_status()
+    except Exception as exc:  # noqa: BLE001 - any transport failure => unavailable
+        raise ServiceUnavailable(f"worker control plane unreachable: {exc}") from exc
+    return WorkerStatusOut.from_entity(status)

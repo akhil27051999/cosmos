@@ -46,3 +46,8 @@ class Forbidden(DomainError):
 
 class QuotaExceeded(DomainError):
     """The tenant has used up its allowance for the current period. -> HTTP 429."""
+
+
+class ServiceUnavailable(DomainError):
+    """An upstream dependency we call synchronously is unreachable (e.g. the
+    worker's gRPC control plane is down). -> HTTP 503."""

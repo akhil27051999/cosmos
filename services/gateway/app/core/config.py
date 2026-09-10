@@ -82,6 +82,10 @@ class Settings(BaseSettings):
     jwt_scope_claim: str = "scope"              # OAuth2 space-delimited scope claim
     jwt_leeway_s: int = 60                      # clock-skew allowance (seconds)
 
+    # Stage 7 part 2 — gRPC control-plane between gateway and worker.
+    worker_grpc_target: str = "worker:50051"    # where the gateway reaches a worker
+    worker_grpc_port: int = 50051               # port the worker's gRPC server binds
+
     log_level: str = "INFO"
 
 
