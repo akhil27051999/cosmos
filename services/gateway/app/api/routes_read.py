@@ -15,8 +15,9 @@ import uuid
 
 from fastapi import APIRouter, Depends
 
-from app.api.deps import get_principal, get_read_model_store
+from app.api.deps import get_read_model_store, require_scope
 from app.api.schemas import JobViewOut
+from app.auth.scopes import JOBS_READ
 from app.domain.exceptions import JobNotFound
 from app.domain.identity import Principal
 from app.ports.read_model import ReadModelStore
@@ -27,7 +28,7 @@ router = APIRouter(prefix="/v1", tags=["read-model"])
 @router.get("/stats")
 async def stats(
     read_model: ReadModelStore = Depends(get_read_model_store),
-    principal: Principal = Depends(get_principal),
+    principal: Principal = Depends(require_scope(JOBS_READ)),
 ) -> dict[str, int]:
     # This tenant's counts only, e.g. {"pending": 3, "succeeded": 42}.
     return await read_model.stats(principal.tenant_id)
@@ -37,7 +38,7 @@ async def stats(
 async def job_view(
     job_id: uuid.UUID,
     read_model: ReadModelStore = Depends(get_read_model_store),
-    principal: Principal = Depends(get_principal),
+    principal: Principal = Depends(require_scope(JOBS_READ)),
 ) -> JobViewOut:
     entry = await read_model.get(str(job_id))
     # 404 if not projected yet (eventual consistency) OR it's another tenant's

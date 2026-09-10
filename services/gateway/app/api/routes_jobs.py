@@ -28,12 +28,13 @@ from app.api.deps import (
     get_job_cache,
     get_job_repository,
     get_job_service,
-    get_principal,
     get_stream_bus,
     get_submit_rate_limiter,
+    require_scope,
 )
 from app.api.schemas import JobCreate, JobDocumentOut, JobEventOut, JobOut
 from app.application.job_service import JobService
+from app.auth.scopes import JOBS_READ, JOBS_WRITE
 from app.domain.exceptions import JobNotFound
 from app.domain.identity import Principal
 from app.ports.cache import JobCache
@@ -54,7 +55,7 @@ async def submit_job(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     service: JobService = Depends(get_job_service),
     limiter: RateLimiter = Depends(get_submit_rate_limiter),
-    principal: Principal = Depends(get_principal),
+    principal: Principal = Depends(require_scope(JOBS_WRITE)),
 ) -> JobOut:
     # LOAD SHEDDING (admission control): if we're over the allowed submission
     # rate, reject fast with 429 instead of accepting work we can't keep up with.
@@ -77,7 +78,7 @@ async def get_job(
     job_id: uuid.UUID,
     repo: JobRepository = Depends(get_job_repository),
     cache: JobCache = Depends(get_job_cache),
-    principal: Principal = Depends(get_principal),
+    principal: Principal = Depends(require_scope(JOBS_READ)),
 ) -> JobOut:
     # CACHE-ASIDE: try the fast copy first; on a miss, read Postgres and
     # populate the cache so the next poll is cheap. Invalidation happens on
@@ -100,7 +101,7 @@ async def get_job_document(
     job_id: uuid.UUID,
     repo: JobRepository = Depends(get_job_repository),
     docs: JobDocumentStore = Depends(get_document_store),
-    principal: Principal = Depends(get_principal),
+    principal: Principal = Depends(require_scope(JOBS_READ)),
 ) -> JobDocumentOut:
     # The big document (payload + result) lives in MongoDB, separate from the
     # metadata in Postgres. 404 if there's no such job for this tenant.
@@ -117,7 +118,7 @@ async def list_jobs(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     repo: JobRepository = Depends(get_job_repository),
-    principal: Principal = Depends(get_principal),
+    principal: Principal = Depends(require_scope(JOBS_READ)),
 ) -> list[JobOut]:
     # Only ever this tenant's jobs — the list is scoped, never global.
     jobs = await repo.list(limit=limit, offset=offset, tenant_id=principal.tenant_id)
@@ -129,7 +130,7 @@ async def get_job_events(
     job_id: uuid.UUID,
     repo: JobRepository = Depends(get_job_repository),
     events: EventStore = Depends(get_event_store),
-    principal: Principal = Depends(get_principal),
+    principal: Principal = Depends(require_scope(JOBS_READ)),
 ) -> list[JobEventOut]:
     # 404 if there's no such job for this tenant (rather than an empty log).
     if await repo.get(job_id, principal.tenant_id) is None:
@@ -142,7 +143,7 @@ async def get_job_events(
 async def cancel_job(
     job_id: uuid.UUID,
     service: JobService = Depends(get_job_service),
-    principal: Principal = Depends(get_principal),
+    principal: Principal = Depends(require_scope(JOBS_WRITE)),
 ) -> JobOut:
     # cancel raises JobNotFound (-> 404, incl. another tenant's job) or
     # InvalidTransition (-> 409 if already terminal). Scoped to the caller.
@@ -155,7 +156,7 @@ async def stream_job(
     job_id: uuid.UUID,
     repo: JobRepository = Depends(get_job_repository),
     bus: StreamBus = Depends(get_stream_bus),
-    principal: Principal = Depends(get_principal),
+    principal: Principal = Depends(require_scope(JOBS_READ)),
 ) -> StreamingResponse:
     # Server-Sent Events: the worker publishes each agent step to the bus; we
     # forward them to the client as `data: {json}\n\n` frames until an `end`
