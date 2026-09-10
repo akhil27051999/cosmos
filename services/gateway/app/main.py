@@ -26,11 +26,15 @@ from app.api import (
     routes_metrics,
     routes_read,
     routes_saga,
+    routes_slo,
 )
 from app.api.errors import install_error_handlers
 from app.core.config import get_settings
 from app.core.correlation import CorrelationIdMiddleware
-from app.core.db import create_all
+from app.core.db import create_all, get_engine
+from app.core.lifecycle import begin_draining
+from app.observability import chaos
+from app.observability.chaos import ChaosMiddleware
 from app.observability.logging import configure_logging
 from app.observability.middleware import MetricsMiddleware
 
@@ -43,7 +47,13 @@ async def lifespan(_: FastAPI):
     # We ensure the schema exists so a fresh clone is runnable immediately.
     await create_all()
     yield
-    # (nothing to tear down yet; engine disposal would go here)
+    # Stage 12 — graceful shutdown: mark not-ready (so k8s stops routing here
+    # while in-flight requests finish), then release the DB connection pool.
+    begin_draining()
+    try:
+        await get_engine().dispose()
+    except Exception:  # noqa: BLE001 - never fail shutdown on cleanup
+        pass
 
 
 def create_app() -> FastAPI:
@@ -54,12 +64,16 @@ def create_app() -> FastAPI:
     """
     # Structured logging first, so everything after logs in the chosen format.
     configure_logging(settings.log_level, settings.log_format)
+    # Apply chaos config from env (off by default).
+    chaos.configure(settings.chaos_enabled, settings.chaos_fault_rate, settings.chaos_latency_ms)
 
     app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
 
-    # Middleware order: the LAST added is OUTERMOST (runs first). We want the
-    # correlation id set BEFORE the metrics middleware logs its access line, so
-    # add metrics first (inner) and correlation last (outer).
+    # Middleware order: the LAST added is OUTERMOST (runs first). Flow becomes
+    # correlation -> metrics -> chaos -> app, so: (a) the correlation id is set
+    # before the metrics access log, and (b) chaos-injected errors are recorded by
+    # the metrics middleware (they burn the SLO budget — the point of the demo).
+    app.add_middleware(ChaosMiddleware)
     app.add_middleware(MetricsMiddleware)
     app.add_middleware(CorrelationIdMiddleware)
 
@@ -74,6 +88,7 @@ def create_app() -> FastAPI:
     app.include_router(routes_admin.router)
     app.include_router(routes_experiments.router)
     app.include_router(routes_saga.router)
+    app.include_router(routes_slo.router)
 
     return app
 

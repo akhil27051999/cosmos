@@ -90,6 +90,16 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: str = "json"                    # "json" (prod/aggregators) | "text" (local)
 
+    # Stage 12 — SLOs / error budgets (targets the /v1/admin/slo report compares to).
+    slo_availability_target: float = 0.99       # 99% non-5xx
+    slo_latency_threshold_seconds: float = 0.5  # a "fast" request (matches a histogram bucket)
+    slo_latency_target: float = 0.95            # 95% of requests under the threshold
+
+    # Stage 12 — chaos injection (OFF unless explicitly enabled; game-day only).
+    chaos_enabled: bool = False
+    chaos_fault_rate: float = 0.0               # 0..1 share of requests failed
+    chaos_latency_ms: int = 0                   # extra latency per request when enabled
+
 
 @lru_cache
 def get_settings() -> Settings:
