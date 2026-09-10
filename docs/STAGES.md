@@ -963,7 +963,68 @@ docker compose logs --tail=20 gateway    # JSON lines: {"ts":...,"level":"INFO",
 
 ---
 
-## Stage 11 — Saga / distributed transactions ⬜ (next)
+## Stage 11 — Saga / distributed transactions ✅
 
-Will add a saga orchestrator for multi-step workflows with compensating actions.
-Steps appended when it lands.
+**What it adds:** all-or-nothing across steps that **can't share a DB
+transaction** (different services/stores), via the **saga pattern** — run steps
+forward; if one fails, run each completed step's **compensation** in reverse.
+
+- **Engine** (`app/saga/engine.py`): a `SagaDefinition` of `Step`s (each an `action` + inverse `compensate`); the `SagaOrchestrator` runs forward, persists after every step, and on failure compensates the completed steps **in reverse**. If a *compensation* fails it stops at `failed` (needs manual repair).
+- **Crash-safe + resumable**: each transition is saved via `SagaStore` (memory/Postgres, `sagas` table); `run()` skips `DONE` steps, so a persisted instance resumes where it left off. Actions/compensations are written to be idempotent.
+- **Applied**: a **tenant-onboarding** saga — create tenant → mint API key → seed a default experiment, each with a delete-compensation. (Those deprovision paths also fill the "no teardown" gap the Stage 8 operator noted.)
+- **API** (admin): `POST /v1/admin/onboarding` runs it; `?simulate_failure=true` appends a failing step to watch it unwind; `GET /v1/admin/sagas/{id}` inspects an instance.
+
+### Test steps
+
+**A. Automated**
+```bash
+cd services/gateway && source .venv/bin/activate && pytest -q
+```
+Expect **101 passed** (adds 8: engine forward-success, compensate-in-reverse, resume-skips-DONE, compensation-failure→failed; onboarding happy path provisions tenant+key+experiment and the key authenticates; simulated failure rolls all three back; get-by-id + 404; admin-gated).
+
+**B. End-to-end (Docker)**
+```bash
+cd services/gateway
+export ADMIN_TOKEN=dev-admin-secret
+docker compose up -d --build
+until curl -sf localhost:8000/healthz >/dev/null; do sleep 1; done; echo ready
+
+# Happy path — provisions a tenant, key, and experiment atomically:
+curl -s -XPOST localhost:8000/v1/admin/onboarding -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -H 'content-type: application/json' -d '{"name":"Acme","monthly_quota":250}' | python3 -m json.tool
+# -> status "completed"; context has tenant_id + api_key
+
+# Failure path — watch it compensate (tenant/key/experiment get rolled back):
+curl -s -XPOST "localhost:8000/v1/admin/onboarding?simulate_failure=true" \
+  -H "X-Admin-Token: $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d '{"name":"Doomed"}' | python3 -m json.tool
+# -> status "compensated"; steps show create-tenant/issue-key = compensated
+```
+Confirm the rollback actually happened:
+```bash
+docker compose exec postgres psql -U cosmos -d cosmos -c \
+  "SELECT name,status,current_index FROM sagas ORDER BY created_at DESC LIMIT 5;"
+# the 'Doomed' tenant should NOT be in the tenants table:
+docker compose exec postgres psql -U cosmos -d cosmos -c "SELECT id,name FROM tenants;"
+```
+
+**What to verify (learning checkpoints):**
+- Happy path: `tenants`, `api_keys`, and an `experiments` row (`welcome-<tenant>`) all appear; the returned `api_key` authenticates.
+- Failure path: none of those rows survive — the saga undid every completed step, in reverse.
+- The `sagas` table row records the terminal `status` and per-step statuses (durable audit of what happened).
+
+### Troubleshooting
+
+| Symptom | Cause & fix |
+|---|---|
+| Saga stuck at `failed` (not `compensated`) | A **compensation** itself failed — the world is partially unwound and needs manual repair. Read `error` on the saga row / response; fix the underlying store, then delete leftovers by hand. |
+| Failure path left a tenant behind | A compensation didn't run or wasn't idempotent. Check step order (compensations run in reverse over `DONE` steps) and the `sagas` row's step statuses. |
+| `onboarding` → 401 | Admin plane — send `X-Admin-Token`. |
+| Duplicate key/tenant on retry | Re-running `start` creates a NEW saga instance (new ids). To *resume* a crashed one you'd reload it and call `run()` (the engine skips DONE steps) — that path is unit-tested; a resume endpoint is a small follow-on. |
+
+---
+
+## Stage 12 — capstone: resilience & release (SLOs, load test, chaos) ⬜ (next)
+
+The final stage — tie it together with SLOs, a load test, and a graceful-shutdown
+/ chaos pass. Steps appended when it lands.

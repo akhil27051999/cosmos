@@ -42,7 +42,8 @@ As later stages arrive, `services/` grows (e.g. a `worker/`), and a top-level
 | **8** | **Kubernetes**: a Helm chart (gateway + worker + backing stores, ConfigMap/Secret, probes, gateway **HPA**) **plus a custom operator** — a `CosmosTenant` **CRD** reconciled by a `kopf` controller that provisions tenants via the admin API and writes credentials to a Secret. | 🟢 pts 1–2 |
 | **9** | **A/B experimentation & feature flags**: deterministic, sticky, weighted variant assignment (hash-based, no stored state); exposure tracking; admin-managed experiments; `/v1/experiments/{key}/assignment` + `/results`. | ✅ built |
 | **10** | **Observability & SRE**: structured JSON logs with correlation IDs, **RED metrics** middleware (rate/errors/duration by route template), a Prometheus `/metrics` endpoint (dependency-free exposition-format registry). | ✅ built |
-| … | Saga/CDC → Go worker + mesh → preview envs → cloud/multi-region | ⬜ |
+| **11** | **Saga / distributed transactions**: a saga orchestrator (forward steps + **compensations in reverse** on failure, persisted for crash-recovery), applied to a **tenant-onboarding** workflow spanning identity + experiments. | ✅ built |
+| … | Go worker + mesh → CDC → preview envs → cloud/multi-region | ⬜ |
 
 ## Quick start (Stage 0)
 

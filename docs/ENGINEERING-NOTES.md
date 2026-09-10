@@ -28,6 +28,7 @@
 5K. **Stage 8 (part 2)** — custom operator + CRD (block-by-block)
 5L. **Stage 9** — A/B experimentation & feature flags (block-by-block)
 5M. **Stage 10** — observability & SRE (block-by-block)
+5N. **Stage 11** — Saga / distributed transactions (block-by-block)
 6. Cross-cutting design decisions & trade-offs
 7. Interview Q&A — what / why / how
 8. Known gaps and what later stages fix
@@ -1286,6 +1287,70 @@ so any dashboard/alert can be built from them.
 
 ---
 
+## 5N. Stage 11 — Saga / distributed transactions (block-by-block)
+
+**Idea:** get **all-or-nothing** across steps that **cannot share one database
+transaction** — different services, different stores, an external call. **Motive:**
+a real workflow (onboard a tenant: create it, mint a key, seed config) touches
+several subsystems; if step 3 fails you must undo steps 1–2, or you leak
+half-provisioned state. A distributed 2-phase commit would do it but is slow,
+lock-heavy, and needs every participant to support it. A **saga** is the practical
+answer: run forward, and on failure run **compensations** to unwind.
+
+**The core principle — compensate in reverse, and persist every step.** Each step
+has an inverse. On failure you undo the *completed* steps in the *opposite* order
+(so dependencies hold — delete the key before the tenant). And you persist after
+every transition, because a saga can span time and survive a crash: the store is
+what lets you resume forward or finish compensating instead of losing track.
+
+### 5N.1 `app/domain/saga.py`
+- `SagaInstance` (id, status, per-step `SagaStep`s, a shared `context` bag,
+  `current_index`, error) and the status machines: saga
+  RUNNING→COMPLETED / →COMPENSATING→COMPENSATED, or →FAILED (a *compensation*
+  failed — the one state needing a human). `context` is how a step passes data to
+  later steps and to compensations (e.g. the tenant id it created).
+
+### 5N.2 `app/saga/engine.py`
+- `Step` = `action` + optional `compensate`; `SagaDefinition` = ordered steps.
+  `SagaOrchestrator.run()`: execute actions in order, saving after each; on a
+  step exception, mark it FAILED and **compensate the prior DONE steps in
+  reverse**, saving after each. **Resume/idempotency:** `run()` skips steps already
+  DONE, so re-running a persisted instance continues from the crash point — which
+  is why actions/compensations must be idempotent. A failing compensation stops at
+  `FAILED` rather than pretending success.
+
+### 5N.3 `SagaStore` port + adapters
+- `save/get/list` over `SagaInstance`; memory + Postgres (`sagas` table, steps +
+  context as JSON — the whole instance is one row you can reload and resume).
+  The engine calls `save` after every transition, so the DB always reflects
+  exactly how far the saga got.
+
+### 5N.4 `app/saga/onboarding.py` — the applied saga
+- Builds the tenant-onboarding `SagaDefinition`: **create-tenant** (comp: delete
+  tenant) → **issue-key** (comp: delete key) → **seed-experiment** (comp: delete
+  experiment). Each compensation uses the new idempotent `delete_*` operations I
+  added to the identity/experiment stores — which also give the platform the
+  tenant **teardown** the Stage-8 operator flagged as missing. A
+  `simulate_failure` flag appends an always-failing step to demonstrate a full
+  unwind.
+
+### 5N.5 API — `routes_saga.py`
+- Admin `POST /v1/admin/onboarding` starts the saga and returns the terminal
+  instance (context carries the tenant id + one-time key on success; shows
+  `compensated` on a simulated failure); `GET /v1/admin/sagas/{id}` inspects one.
+
+> **How this differs from the Stage-5 outbox:** the outbox guarantees an event is
+> *published* atomically with a DB write (a messaging concern). A saga coordinates
+> a *multi-step business workflow* with explicit rollback. They compose — a saga
+> step could publish via the outbox — but solve different problems.
+
+> **Honest scope:** the onboarding endpoint runs the saga synchronously and stores
+> the one-time API key in the saga `context` (a demo simplification — production
+> wouldn't persist the plaintext in saga state). A resume-after-crash endpoint and
+> async execution are small follow-ons on the same engine.
+
+---
+
 ## 6. Cross-cutting design decisions & trade-offs
 
 | Decision | Why | Trade-off / later fix |
@@ -1355,6 +1420,11 @@ so any dashboard/alert can be built from them.
 | Dependency-free metrics registry | hermetic tests; exposition format explicit | reimplements what prometheus_client gives (swap for prod) |
 | Structured JSON logs + correlation id | pivotable in an aggregator; seeds tracing | noisier than plain text locally (text mode exists) |
 | `/metrics` unauthenticated | standard scrape model | must be network-restricted in prod |
+| Saga over 2-phase commit | no locks/coordinator; works across services | eventual/rollback semantics, not atomic isolation |
+| Compensate completed steps in reverse | respects dependencies when unwinding | every step needs a correct inverse |
+| Persist after every step | crash-recoverable + resumable | a save per transition (more writes) |
+| Compensation failure → FAILED (stop) | surfaces partial state for a human | not auto-healed; needs manual repair |
+| Idempotent actions/compensations | safe to resume / retry | each op must be written that way |
 | LLM behind a port + scripted fake | tests run with no key/network/cost | one more abstraction layer |
 | Agent guardrails (token budget, max steps) | bound cost + prevent infinite loops | may stop before a hard task finishes |
 | SSE via Redis pub/sub | live progress across processes | live-only (no replay) until Stage 5-style history stream |
@@ -1789,6 +1859,34 @@ line. That's the seed: full tracing adds spans and a W3C `traceparent` propagate
 to downstream services with an OTel exporter to Jaeger/Tempo — but the "one id
 threads a request across logs/services" mechanism is already here.
 
+**Q: How do you keep a multi-step workflow consistent across services? (Stage 11)**
+The saga pattern. Each step has a forward action and a compensating inverse; the
+orchestrator runs forward and, if a step fails, runs the completed steps'
+compensations **in reverse**, so the system ends fully applied or fully unwound —
+without a distributed transaction. My onboarding saga (create tenant → mint key →
+seed experiment) rolls all three back if any fails.
+
+**Q: Why a saga instead of two-phase commit?**
+2PC needs a coordinator, holds locks across services for the duration, and
+requires every participant to speak the protocol — it doesn't fit HTTP APIs and
+different datastores, and it hurts availability. A saga trades atomic isolation
+for **compensation**: no locks, works across heterogeneous services, and stays
+available. The cost is that intermediate states are briefly visible and you must
+write a correct inverse for each step.
+
+**Q: What makes it crash-safe?**
+The instance is persisted after every step and every compensation. So on restart
+you can reload it and either resume forward (the engine skips steps already
+`DONE`) or finish compensating. That's also why actions and compensations must be
+**idempotent** — a step may be retried after a crash that happened between doing
+the work and recording it.
+
+**Q: What if a compensation itself fails?**
+The saga stops in the `failed` state with the error recorded — deliberately not
+pretending it unwound. That's the one case a human (or an alert) must handle,
+because the world is partially rolled back; everything up to that point is
+already undone.
+
 ## 8. Known gaps and what later stages fix
 - **MongoDB trajectories + Redis hot state** (polyglot) → **Stage 2**. ✅ done
 - **Multi-store consistency** (Mongo+Postgres+Redis not atomic) → transactional **outbox + CDC**, **Stage 5**.
@@ -1818,7 +1916,9 @@ threads a request across logs/services" mechanism is already here.
 - **Consuming a variant's config** to change behavior (e.g. worker picks the variant's model per job) + a **web UI** to visualize results → follow-ons on Stage 9.
 - **Observability** (structured logs, RED metrics, Prometheus `/metrics`) → **Stage 10**. ✅ done
 - **Distributed tracing** (OTel spans + W3C `traceparent` + Jaeger/Tempo exporter) and **worker `/metrics`** → follow-ons on Stage 10.
-- **Saga / compensating transactions** for multi-step workflows → **Stage 11**.
+- **Saga / compensating transactions** for multi-step workflows (+ tenant teardown via idempotent deletes) → **Stage 11**. ✅ done
+- **Saga resume endpoint + async execution** (the engine already supports resume) → small follow-on.
+- **CDC** (change-data-capture off the DB WAL as an alternative to the outbox) → later increment.
 - **Per-tenant rate limits** (reuse the Stage-4 bucket keyed by tenant) → small follow-on.
 - **Quota check + usage record aren't atomic** (tiny overshoot under bursts) → acceptable for a coarse monthly quota; a stricter limit would reserve-then-commit.
 
@@ -1880,3 +1980,7 @@ threads a request across logs/services" mechanism is already here.
 - **cardinality** — the number of distinct label-value series; unbounded labels (raw URLs, ids) blow it up.
 - **structured logging** — one machine-parseable object per line, pivotable by fields like `correlation_id`.
 - **distributed tracing / span / traceparent** — following one request across services via propagated ids (the next increment).
+- **saga** — all-or-nothing across steps that can't share a transaction, via forward actions + compensations.
+- **compensation / compensating action** — the inverse of a step, run to undo it when a later step fails.
+- **orchestration (vs choreography)** — a central coordinator drives the steps (here) vs each service reacting to events.
+- **two-phase commit (2PC)** — a locking distributed-transaction protocol the saga pattern avoids.
