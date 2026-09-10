@@ -25,3 +25,9 @@ class InMemoryIdentityStore:
     async def get_api_key(self, key_id: str) -> ApiKey | None:
         found = self._keys.get(key_id)
         return copy.deepcopy(found) if found else None
+
+    async def delete_tenant(self, tenant_id: str) -> None:
+        self._tenants.pop(tenant_id, None)   # idempotent
+
+    async def delete_api_key(self, key_id: str) -> None:
+        self._keys.pop(key_id, None)         # idempotent

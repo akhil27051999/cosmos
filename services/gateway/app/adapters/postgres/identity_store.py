@@ -57,3 +57,17 @@ class PostgresIdentityStore:
         async with self._sm() as session:
             row = await session.get(ApiKeyModel, key_id)
             return _key_to_entity(row) if row else None
+
+    async def delete_tenant(self, tenant_id: str) -> None:
+        async with self._sm() as session:
+            row = await session.get(TenantModel, tenant_id)
+            if row is not None:
+                await session.delete(row)
+                await session.commit()
+
+    async def delete_api_key(self, key_id: str) -> None:
+        async with self._sm() as session:
+            row = await session.get(ApiKeyModel, key_id)
+            if row is not None:
+                await session.delete(row)
+                await session.commit()

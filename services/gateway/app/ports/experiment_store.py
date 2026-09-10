@@ -26,3 +26,7 @@ class ExperimentStore(Protocol):
     async def set_status(self, key: str, status: ExperimentStatus) -> Experiment | None:
         """Update lifecycle status; return the updated experiment, or None if absent."""
         ...
+
+    async def delete(self, key: str) -> None:
+        """Remove an experiment (saga compensation). Idempotent."""
+        ...

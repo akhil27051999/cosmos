@@ -32,3 +32,11 @@ class IdentityStore(Protocol):
     async def get_api_key(self, key_id: str) -> ApiKey | None:
         """Fetch an API key by its public key-id — the auth hot path, one lookup."""
         ...
+
+    async def delete_tenant(self, tenant_id: str) -> None:
+        """Remove a tenant (used to compensate a failed onboarding saga). Idempotent."""
+        ...
+
+    async def delete_api_key(self, key_id: str) -> None:
+        """Remove an API key (saga compensation / deprovision). Idempotent."""
+        ...

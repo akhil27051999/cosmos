@@ -55,3 +55,10 @@ class PostgresExperimentStore:
             row.status = status.value
             await session.commit()
             return _to_entity(row)
+
+    async def delete(self, key: str) -> None:
+        async with self._sm() as session:
+            row = await session.get(ExperimentModel, key)
+            if row is not None:
+                await session.delete(row)
+                await session.commit()

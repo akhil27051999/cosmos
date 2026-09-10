@@ -27,3 +27,6 @@ class InMemoryExperimentStore:
             return None
         exp.status = status
         return copy.deepcopy(exp)
+
+    async def delete(self, key: str) -> None:
+        self._experiments.pop(key, None)   # idempotent
