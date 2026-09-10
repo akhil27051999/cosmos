@@ -256,8 +256,8 @@ cd ~/Desktop/cosmos-platform/services/gateway && docker compose up -d && docker 
 docker compose down
 ```
 
-## 7. What exists now (created across Stages 0–8 pt1)
-- **Services:** `gateway` (FastAPI API) + `worker` (queue consumer running the agent + the outbox relay + the CQRS projector + a **gRPC control-plane server**) — one codebase, multiple processes.
+## 7. What exists now (created across Stages 0–8 pt2)
+- **Services:** `gateway` (FastAPI API) + `worker` (agent + outbox relay + CQRS projector + gRPC control-plane server) + `operator` (a `kopf` controller reconciling `CosmosTenant` CRs).
 - **Stores:** Postgres (jobs + job_events + outbox + job_read_model + **tenants + api_keys + usage_ledger**), MongoDB (job_documents + trajectory), Redis (job queue + cache + SSE pub/sub + rate-limit bucket), Redpanda (event backbone: `job-events` topic).
 - **Event backbone (Stage 5 pt1):** every event is staged in an `outbox` table in the same transaction, and a relay drains it to Redpanda at-least-once (transactional outbox).
 - **CQRS read model (Stage 5 pt2):** a projector (`cqrs-projector` consumer group) folds `job-events` into a denormalized, **tenant-scoped** read model, idempotent under at-least-once via version last-writer-wins. Served by `/v1/stats` and `/v1/jobs/{id}/view`.
@@ -265,8 +265,9 @@ docker compose down
 - **OAuth2/OIDC + scopes (Stage 7 pt1):** a caller may instead present an **OIDC JWT** on the same Bearer header (HS256 verified: signature + `exp`/`nbf`/`iss`/`aud`, `alg:none` refused), resolved to the same tenant `Principal`; **scope-based authorization** (`jobs:read`/`jobs:write`) gates each route — 401 (authN) and 403 (authZ) are distinct. Enable with `JWT_HS256_SECRET`.
 - **gRPC control plane (Stage 7 pt2):** a typed **protobuf** contract (`proto/worker_control.proto`) between gateway and worker — data plane stays on the async queue, control plane is sync gRPC. The worker serves live status/health on **:50051**; `GET /v1/admin/worker/status` calls it (503 if unreachable). Stubs are generated at Docker build; behind a port so `pytest` needs no gRPC.
 - **Kubernetes (Stage 8 pt1):** a Helm chart (`deploy/helm/cosmos/`) deploys gateway + worker + backing stores — ConfigMap/Secret split, `/healthz` & `/readyz` probes, gateway **HPA**, dev-stores toggle (`backingServices.enabled`) for prod. Validate offline with `helm lint`/`helm template`; run live on `minikube` (see `deploy/README.md`).
+- **Operator (Stage 8 pt2):** a `CosmosTenant` **CRD** + a `kopf` controller (`services/operator/`) — `kubectl apply` a CosmosTenant and it provisions the tenant via the admin API, writes the API key into a CR-owned Secret, and records the tenant id in status (idempotent). Ships in the chart under `operator.enabled` with its CRD + RBAC. Pure reconcile logic is unit-tested (`cd services/operator && pytest` → 3 passed).
 - **Agent:** Claude/Groq agent loop (tool use + token budget), LLM behind a port, provider-swappable via `LLM_PROVIDER`.
 - **Resilience (Stage 4):** the provider call is wrapped in timeout → retry(backoff+jitter) → circuit breaker → fallback; `POST /v1/jobs` sheds excess load with **429** via a distributed token bucket.
 - **Endpoints (all `/v1/*` need an API key *or* an OIDC JWT, with the right scope):** `POST /v1/jobs` (202; 429 when shed *or* over quota), `GET /v1/jobs`, `GET /v1/jobs/{id}`, `GET /v1/jobs/{id}/document`, `GET /v1/jobs/{id}/events`, `GET /v1/jobs/{id}/stream` (SSE), `POST /v1/jobs/{id}/cancel`, `GET /v1/stats`, `GET /v1/jobs/{id}/view`; **admin** (need `X-Admin-Token`): `POST /v1/admin/tenants`, `POST /v1/admin/tenants/{id}/keys`, `GET /v1/admin/worker/status` (gRPC to the worker); `GET /healthz`, `GET /readyz` (no auth).
-- **Tests:** 76 passing (+ gRPC control plane: metrics→status snapshot, admin-gated route, status payload, 503 when worker down, and "app import doesn't import grpc").
+- **Tests:** gateway **76 passing** (`cd services/gateway && pytest`); operator **3 passing** (`cd services/operator && pytest` — pure reconcile logic, no cluster). Chart validated with `helm lint` + `helm template`.
 - **Docs:** this file + `ENGINEERING-NOTES.md` + `STAGES.md`.

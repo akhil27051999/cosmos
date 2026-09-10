@@ -25,6 +25,7 @@
 5H. **Stage 7 (part 1)** — OAuth2/OIDC JWT + scopes (block-by-block)
 5I. **Stage 7 (part 2)** — typed gRPC control plane (block-by-block)
 5J. **Stage 8 (part 1)** — Kubernetes packaging with Helm (block-by-block)
+5K. **Stage 8 (part 2)** — custom operator + CRD (block-by-block)
 6. Cross-cutting design decisions & trade-offs
 7. Interview Q&A — what / why / how
 8. Known gaps and what later stages fix
@@ -1098,6 +1099,68 @@ de-facto standard for shipping k8s apps.
 
 ---
 
+## 5K. Stage 8 (part 2) — custom operator + CRD (block-by-block)
+
+**Idea:** extend the Kubernetes API itself with a **Custom Resource** —
+`CosmosTenant` — and run a **controller (operator)** that reconciles it: you
+`kubectl apply` a tenant, and the operator provisions it on the platform. **Motive:**
+this is the **operator pattern**, how platforms make their own concepts
+first-class k8s objects (declarative, GitOps-able, self-healing). It also closes a
+nice loop — the Stage 6 admin API is now driven by a Kubernetes controller.
+
+**The core principle — level-triggered, idempotent reconciliation.** A controller
+doesn't run once; it's called repeatedly for the same object (on create, on
+operator restart via *resume*, on every edit, on periodic re-sync). So the logic
+must converge the world to the spec **without** repeating side effects — here,
+never minting a second tenant. That property is the whole design.
+
+### 5K.1 The CRD (`templates/operator/crd.yaml`)
+- Registers `cosmostenants.cosmos.dev`: an OpenAPI v3 schema validating `spec`
+  (`displayName` required, `monthlyQuota` optional), a **`status` subresource**
+  (so the controller patches status without touching spec, and users can't hand-
+  edit it), and **printer columns** so `kubectl get ctenant` shows phase + tenant
+  id. Registering the CRD makes `CosmosTenant` a real, `kubectl`-native kind.
+
+### 5K.2 `services/operator/app/reconcile.py` — the pure logic
+- Framework-free: `TenantSpec` in, a `ReconcileResult` (status patch + optional
+  Secret data) out, talking to an `AdminClient` **port**. The idempotency lives
+  here: **if `status.tenantId` is already set, it's a no-op** (re-assert Ready,
+  create nothing). This is what makes it safe under repeated reconciliation — and
+  it's unit-tested with a fake admin client, no cluster, no kopf.
+
+### 5K.3 `services/operator/app/admin_client.py`
+- `HttpAdminClient` calls `POST /v1/admin/tenants` with the admin token (httpx,
+  lazy import). A non-2xx raises → the handler turns it into a retry. Behind the
+  port so tests never hit the network.
+
+### 5K.4 `services/operator/app/handlers.py` — the kopf glue
+- `@kopf.on.create / .resume / .update` all point at one handler, so the resource
+  converges however it's triggered (idempotency makes the fan-in safe). The
+  handler reads the spec, calls `reconcile()`, and on a fresh provision writes the
+  **credentials Secret** — capturing the API key the gateway returns **once** —
+  using `kopf.adopt()` so the Secret is **owned by the CR** and garbage-collected
+  when the CR is deleted. It returns a dict that kopf merges into `status`. Admin
+  failures become `kopf.TemporaryError` (retry with backoff), not a permanent
+  failure. `on.delete` logs (the admin API has no delete-tenant endpoint yet).
+
+### 5K.5 RBAC + Deployment (`templates/operator/*.yaml`)
+- A ServiceAccount the operator runs as, and a ClusterRole granting exactly what
+  it needs: watch/patch `cosmostenants` (+ status), create/patch Secrets, post
+  Events, and read the CRD/namespaces (what kopf needs). The Deployment runs
+  `kopf run --standalone` (single instance, no peering — so no extra peering
+  CRDs/RBAC), wired via env to the gateway Service URL and the shared
+  `ADMIN_TOKEN` Secret. All gated by `operator.enabled`.
+
+> **Why the credentials go in a Secret the CR owns:** the gateway reveals the API
+> key exactly once, so the operator must persist it immediately — a k8s Secret is
+> the natural home, and the owner reference ties its lifecycle to the CR.
+
+> **Honest scope:** deleting a CosmosTenant doesn't deprovision the tenant (no
+> admin DELETE endpoint yet) — it only GCs the Secret. Real production would add
+> a finalizer + a delete API so teardown is complete.
+
+---
+
 ## 6. Cross-cutting design decisions & trade-offs
 
 | Decision | Why | Trade-off / later fix |
@@ -1151,6 +1214,12 @@ de-facto standard for shipping k8s apps.
 | HPA owns replicas (Deployment omits them) | autoscaler and chart don't fight | manual scaling needs the HPA off |
 | Bundled dev stores behind a toggle | one-command runnable stack | not HA/backed-up → managed services in prod |
 | App code unchanged for k8s | proves the app was deployment-agnostic | packaging complexity moves to the chart |
+| Operator pattern (CRD + controller) | tenants become declarative, GitOps-able k8s objects | an operator to run; k8s API extended |
+| Reconcile keyed on status.tenantId (idempotent) | safe under repeated/level-triggered reconciliation | relies on status being persisted correctly |
+| Pure reconcile logic, kopf as thin glue | unit-testable with no cluster/kopf | handler still needs live e2e for k8s I/O |
+| Credentials → CR-owned Secret | one-time API key persisted; GC'd with the CR | secret sits in etcd (encrypt at rest in prod) |
+| `kopf run --standalone` | no peering CRDs/RBAC; simple single instance | no multi-replica HA for the operator |
+| No deprovision on delete (yet) | ships the create path now | delete leaves the tenant → needs a finalizer + admin DELETE |
 | LLM behind a port + scripted fake | tests run with no key/network/cost | one more abstraction layer |
 | Agent guardrails (token budget, max steps) | bound cost + prevent infinite loops | may stop before a hard task finishes |
 | SSE via Redis pub/sub | live progress across processes | live-only (no replay) until Stage 5-style history stream |
@@ -1507,6 +1576,34 @@ at start. Stamping a `sha256sum` of the rendered config/secret into the pod
 template annotations changes the template on every content change, so a
 `helm upgrade` performs a rolling restart and the new config actually takes effect.
 
+**Q: What's the operator pattern, and what did you build with it? (Stage 8 pt2)**
+An operator extends Kubernetes with a **Custom Resource** (via a CRD) plus a
+**controller** that watches it and reconciles the real world to the resource's
+spec. I defined a `CosmosTenant` CRD and a `kopf` controller: `kubectl apply` a
+CosmosTenant and the operator calls the gateway admin API to provision the tenant,
+stores the returned API key in a k8s Secret, and records the tenant id in the
+CR's status. Tenants become declarative, `kubectl`-native, GitOps-able objects.
+
+**Q: Controllers get called repeatedly — how do you avoid provisioning twice?**
+Level-triggered, idempotent reconciliation. The handler fires on create, on
+operator restart (*resume*), on every edit, and on re-syncs — so it must converge
+without repeating side effects. I key on the CR's `status.tenantId`: if it's
+already set, reconcile is a no-op. That's the single most important property of a
+correct operator, and it's the thing my unit tests pin down.
+
+**Q: The API key is shown only once — how does the operator not lose it?**
+On a fresh provision the handler immediately writes the gateway's one-time key
+into a Kubernetes Secret named `<cr>-credentials`, and uses `kopf.adopt()` to set
+the CosmosTenant as the Secret's owner — so the Secret is garbage-collected when
+the CR is deleted, and its lifecycle tracks the tenant's.
+
+**Q: How is the operator testable without a cluster?**
+The reconcile decision is a pure function (`reconcile.py`) over a `TenantSpec`,
+the current status, and an `AdminClient` port — no kopf, no kubernetes client. The
+kopf handlers are thin glue that do the k8s I/O around it. So `pytest` exercises
+the create/idempotent/quota paths with a fake admin client and no cluster; the
+handler's k8s calls are validated live on minikube.
+
 ## 8. Known gaps and what later stages fix
 - **MongoDB trajectories + Redis hot state** (polyglot) → **Stage 2**. ✅ done
 - **Multi-store consistency** (Mongo+Postgres+Redis not atomic) → transactional **outbox + CDC**, **Stage 5**.
@@ -1529,7 +1626,8 @@ template annotations changes the template on every content change, so a
 - **Typed gRPC control-plane contract** (gateway↔worker status/health) → **Stage 7 part 2**. ✅ done
 - **Rewrite the worker in Go** behind the same proto, **mutual-TLS**, **service mesh** → later.
 - **Kubernetes packaging** (Helm chart: gateway+worker+stores, ConfigMap/Secret, probes, HPA) → **Stage 8 part 1**. ✅ done
-- **Custom operator + CRD** (`CosmosTenant` reconciled to provision tenants/keys) → **Stage 8 part 2**.
+- **Custom operator + CRD** (`CosmosTenant` reconciled to provision tenants/keys) → **Stage 8 part 2**. ✅ done
+- **Operator teardown** (finalizer + an admin DELETE-tenant endpoint so deleting a CR deprovisions) → follow-on.
 - **Production storage** (StatefulSets/managed DBs, backups, HA), **Ingress/TLS**, **NetworkPolicies**, **PodDisruptionBudgets** → hardening increments.
 - **Per-tenant rate limits** (reuse the Stage-4 bucket keyed by tenant) → small follow-on.
 - **Quota check + usage record aren't atomic** (tiny overshoot under bursts) → acceptable for a coarse monthly quota; a stricter limit would reserve-then-commit.
@@ -1575,3 +1673,9 @@ template annotations changes the template on every content change, so a
 - **HPA (HorizontalPodAutoscaler)** — scales replica count on a metric (here gateway CPU).
 - **PVC (PersistentVolumeClaim)** — a pod's request for durable storage (used by the stateful dev stores).
 - **operator / CRD** — a custom controller that reconciles a Custom Resource toward desired state (Stage 8 pt2).
+- **Custom Resource (CR) / CustomResourceDefinition (CRD)** — a user-defined k8s object kind / the schema that registers it.
+- **reconciliation (level-triggered)** — repeatedly driving the world to match a resource's spec; must be idempotent.
+- **status subresource** — the part of a CR a controller writes (separate from spec).
+- **kopf** — a Python framework for writing k8s operators as decorated handler functions.
+- **ownerReference / GC** — links a child object to its owner so k8s deletes it when the owner goes away.
+- **finalizer** — a marker that blocks deletion until a controller runs teardown (a follow-on here).

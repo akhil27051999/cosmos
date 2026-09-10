@@ -64,4 +64,22 @@ helm upgrade --install cosmos deploy/helm/cosmos -n cosmos \
   --set secrets.create=false --set secrets.existingSecret=cosmos-prod-secrets
 ```
 
-See `docs/STAGES.md` (Stage 8) for the full test + troubleshooting runbook.
+## The CosmosTenant operator (Stage 8 pt2)
+
+The chart also installs a **CosmosTenant** CRD + a `kopf` operator (image built
+from `services/operator/`). Declare a tenant as a Kubernetes object and the
+operator provisions it via the gateway admin API, storing the credentials in a
+Secret:
+
+```bash
+# build the operator image into the cluster too
+cd services/operator && eval $(minikube docker-env) && docker build -t cosmos-operator:latest . && cd ../..
+
+kubectl -n cosmos apply -f deploy/helm/cosmos/samples/cosmostenant-example.yaml
+kubectl -n cosmos get cosmostenants          # PHASE -> Ready, TENANT id fills in
+kubectl -n cosmos get secret acme-credentials -o jsonpath='{.data.api_key}' | base64 -d
+```
+
+Disable it with `--set operator.enabled=false` (drops the CRD, RBAC, and
+Deployment). See `docs/STAGES.md` (Stage 8) for the full test + troubleshooting
+runbook.

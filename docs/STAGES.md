@@ -793,8 +793,65 @@ curl -s localhost:8000/v1/admin/worker/status -H "X-Admin-Token: $ADMIN" | pytho
 
 ---
 
-## Stage 8 — part 2 (custom operator + CRD) ⬜ (next)
+## Stage 8 — part 2 (custom operator + CRD) ✅
 
-Will add a `CosmosTenant` CustomResourceDefinition and a controller that
-reconciles it (provisioning tenants/keys via the admin API) — the operator
-pattern. Needs a live cluster; steps appended when it lands.
+**What it adds:** the **operator pattern** — extend Kubernetes with a custom
+resource and a controller that reconciles it. Now you declare a tenant as a k8s
+object and the platform provisions it for you.
+
+- **CRD** `cosmostenants.cosmos.dev` (`kind: CosmosTenant`, short name `ctenant`) — spec: `displayName`, `monthlyQuota`; a `status` subresource the controller fills (`phase`, `tenantId`, `keyPrefix`, `secretName`); printer columns so `kubectl get ctenant` shows them.
+- **Operator** (`services/operator/`, a `kopf` controller): on create/resume/update it calls the gateway admin API (`POST /v1/admin/tenants`), writes the one-time API key into a `<name>-credentials` Secret (owned by the CR, so it's garbage-collected), and records `tenantId` in status. **Idempotent** — it never re-mints on a re-sync.
+- **RBAC** (ServiceAccount + ClusterRole + binding), operator Deployment, and the CRD are all in the Helm chart, gated by `operator.enabled`. The reconcile logic is pure Python and **unit-tested without a cluster** (3 tests).
+
+### Test steps
+
+**A. Automated (pure reconcile logic — no cluster, no kopf)**
+```bash
+cd services/operator
+python -m pytest -q          # (uses the gateway venv's pytest, or: pip install pytest pytest-asyncio)
+```
+Expect **3 passed** — provisions when status is empty, is idempotent when already provisioned, passes `None` quota through.
+
+**B. Live on minikube** (continues the Stage 8 pt1 cluster)
+```bash
+cd services/gateway && eval $(minikube docker-env)
+docker build -t cosmos-gateway:latest .                    # app image (if not already built)
+cd ../operator && docker build -t cosmos-operator:latest . # operator image (kopf)
+
+cd ../..
+helm upgrade --install cosmos deploy/helm/cosmos -n cosmos --create-namespace \
+  --set secrets.adminToken=$(openssl rand -hex 16)
+kubectl -n cosmos get pods -w        # wait for the -operator pod to be Running
+```
+
+**C. Declare a tenant and watch the operator provision it**
+```bash
+kubectl -n cosmos apply -f deploy/helm/cosmos/samples/cosmostenant-example.yaml
+
+kubectl -n cosmos get cosmostenants                # PHASE -> Ready, TENANT id fills in
+kubectl -n cosmos describe ctenant acme            # events + status
+# The credentials the operator captured (the API key is shown once by the gateway):
+kubectl -n cosmos get secret acme-credentials -o jsonpath='{.data.api_key}' | base64 -d; echo
+```
+
+**What to verify (learning checkpoints):**
+- `kubectl get ctenant` shows `Ready` + a `t_...` tenant id in the printer columns.
+- The `acme-credentials` Secret exists and its `api_key` authenticates against the gateway (`Authorization: Bearer <key>`).
+- **Idempotency:** `kubectl annotate ctenant acme x=1 --overwrite` (forces an update event) → the operator does NOT create a second tenant (check `kubectl -n cosmos logs deploy/cosmos-operator` — "already provisioned").
+- **Ownership GC:** `kubectl delete ctenant acme` → the `acme-credentials` Secret is auto-deleted (ownerReference).
+
+### Troubleshooting
+
+| Symptom | Cause & fix |
+|---|---|
+| CR stuck `phase: Provisioning` | The operator can't reach the gateway admin API or the token's wrong. `kubectl -n cosmos logs deploy/cosmos-operator`; confirm `GATEWAY_ADMIN_URL` and that `ADMIN_TOKEN` in the Secret matches the gateway's. kopf retries with backoff. |
+| Operator pod `CrashLoopBackOff` on startup | RBAC missing — it can't watch the CRD. Ensure `operator.enabled=true` installed the ClusterRole/binding; `kubectl auth can-i list cosmostenants --as=system:serviceaccount:cosmos:cosmos-operator`. |
+| `kubectl apply` of the CR → "no matches for kind CosmosTenant" | The CRD isn't installed. It ships with the chart (`operator.enabled=true`); re-run `helm upgrade`. |
+| Secret never appears | Check operator logs for a k8s API error; the SA needs `secrets: create` (it does via the ClusterRole). Also confirm the CR reached `Ready`. |
+| A second tenant got created on edit | Shouldn't happen — reconcile keys on `status.tenantId`. If it did, the status write failed previously; check logs and whether the status subresource is enabled on the CRD. |
+
+---
+
+## Stage 9 — frontend + experimentation ⬜ (next)
+
+Will add a web frontend and A/B experimentation. Steps appended when it lands.
