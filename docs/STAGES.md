@@ -721,7 +721,80 @@ grpcurl -plaintext -import-path proto -proto worker_control.proto \
 
 ---
 
-## Stage 8 — Kubernetes & an operator ⬜ (next)
+## Stage 8 — part 1 (Kubernetes Helm chart) ✅
 
-Will containerize for k8s (manifests/Helm) and introduce a custom operator/CRD to
-manage the platform. Steps appended when it lands.
+**What it adds:** the platform now deploys to **Kubernetes** via a Helm chart
+(`deploy/helm/cosmos/`) — no code changes, pure packaging/ops.
+
+- **gateway** Deployment (uvicorn) + Service + **HPA** (CPU-based), liveness `/healthz` / readiness `/readyz` probes.
+- **worker** Deployment (`python -m app.worker`) + Service (gRPC `:50051`), TCP readiness on the gRPC port.
+- **ConfigMap** (non-secret env; computes in-cluster connection URLs) + **Secret** (`ADMIN_TOKEN`, JWT secret, provider keys) — the workloads `envFrom` both. A config/secret change rolls the pods (checksum annotations).
+- **Dev backing stores** (Postgres/Redis/Mongo/Redpanda) as single-replica Deployments+PVCs, gated by `backingServices.enabled` — set it `false` in prod and point `config.*Url` at managed services; the app manifests don't change.
+- Pod hardening (`runAsNonRoot`), resource requests/limits throughout.
+
+> This stage produces **YAML, not Python** — so `pytest` doesn't cover it. It's
+> validated with `helm lint` + `helm template` (offline) and a live `minikube` run.
+
+### Test steps
+
+**A. Offline validation (no cluster)**
+```bash
+helm lint deploy/helm/cosmos                 # -> 0 charts failed
+helm template rel deploy/helm/cosmos         # renders 17 objects; eyeball them
+# prod shape drops the dev stores:
+helm template rel deploy/helm/cosmos --set backingServices.enabled=false | grep -c 'component: postgres'   # -> 0
+```
+
+**B. Live on minikube**
+```bash
+minikube start
+minikube addons enable metrics-server        # required for the gateway HPA
+
+# Build the image INTO minikube's Docker (no registry needed):
+eval $(minikube docker-env)
+docker build -t cosmos-gateway:latest services/gateway
+
+helm install cosmos deploy/helm/cosmos -n cosmos --create-namespace \
+  --set secrets.adminToken=$(openssl rand -hex 16) \
+  --set secrets.jwtHs256Secret=$(openssl rand -hex 32)
+
+kubectl -n cosmos get pods -w                # wait until all Running & Ready
+```
+
+**C. Exercise it**
+```bash
+kubectl -n cosmos port-forward svc/cosmos-gateway 8000:8000 &
+until curl -sf localhost:8000/healthz >/dev/null; do sleep 1; done; echo ready
+
+ADMIN=$(kubectl -n cosmos get secret cosmos-secrets -o jsonpath='{.data.ADMIN_TOKEN}' | base64 -d)
+curl -s -XPOST localhost:8000/v1/admin/tenants -H "X-Admin-Token: $ADMIN" \
+  -H 'content-type: application/json' -d '{"name":"Acme"}' | python3 -m json.tool
+# use the returned api_key to submit, then check worker status over gRPC:
+curl -s localhost:8000/v1/admin/worker/status -H "X-Admin-Token: $ADMIN" | python3 -m json.tool
+```
+
+**What to verify (learning checkpoints):**
+- All pods reach `Running`/`Ready`; the gateway waits on `/readyz` (its deps) before receiving traffic.
+- `kubectl -n cosmos get hpa` shows the gateway HPA with current/target CPU.
+- Killing a gateway pod (`kubectl delete pod`) → the Deployment recreates it; the Service keeps serving.
+- `helm upgrade ... --set gateway.autoscaling.enabled=false --set gateway.replicaCount=3` scales manually.
+
+### Troubleshooting
+
+| Symptom | Cause & fix |
+|---|---|
+| Gateway/worker pods `ErrImagePull` / `ImagePullBackOff` | The image isn't in the cluster. Run `eval $(minikube docker-env)` **then** `docker build -t cosmos-gateway:latest services/gateway`; keep `image.pullPolicy=IfNotPresent`. |
+| Pods stuck `Pending` | No PV for the PVCs, or not enough CPU/memory. `kubectl -n cosmos describe pod <p>`; on minikube the default storageclass provisions automatically — ensure the cluster has resources (`minikube start --cpus 4 --memory 6g`). |
+| Gateway `CrashLoopBackOff` | Usually can't reach a backing store yet. Check `kubectl -n cosmos logs deploy/cosmos-gateway`; confirm the store pods are Ready and the ConfigMap URLs match their Service names. |
+| Gateway never becomes Ready | `/readyz` failing (a dependency down). It's readiness, not liveness, so the pod stays up but out of the Service — fix the dependency. |
+| `HPA <unknown>/70%` | metrics-server isn't running. `minikube addons enable metrics-server` and wait ~30s. |
+| Everything 401s | That's expected — auth is on. Pull `ADMIN_TOKEN` from the Secret (see step C) and mint a tenant/key. |
+| Reinstall leaves old data | PVCs survive `helm uninstall`. Delete them (`kubectl -n cosmos delete pvc --all`) for a clean slate. |
+
+---
+
+## Stage 8 — part 2 (custom operator + CRD) ⬜ (next)
+
+Will add a `CosmosTenant` CustomResourceDefinition and a controller that
+reconciles it (provisioning tenants/keys via the admin API) — the operator
+pattern. Needs a live cluster; steps appended when it lands.

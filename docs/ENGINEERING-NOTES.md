@@ -24,6 +24,7 @@
 5G. **Stage 6** — multi-tenancy & identity (block-by-block)
 5H. **Stage 7 (part 1)** — OAuth2/OIDC JWT + scopes (block-by-block)
 5I. **Stage 7 (part 2)** — typed gRPC control plane (block-by-block)
+5J. **Stage 8 (part 1)** — Kubernetes packaging with Helm (block-by-block)
 6. Cross-cutting design decisions & trade-offs
 7. Interview Q&A — what / why / how
 8. Known gaps and what later stages fix
@@ -1028,6 +1029,75 @@ Choosing the right communication style per concern is the whole lesson here.
 
 ---
 
+## 5J. Stage 8 (part 1) — Kubernetes packaging with Helm (block-by-block)
+
+**Idea:** package the whole platform so it runs on **Kubernetes** — declaratively,
+repeatably, and parameterised per environment — using a **Helm chart**. **Motive:**
+Docker Compose is a single-host dev tool; production orchestration (self-healing,
+horizontal scaling, rolling updates, config/secret management, service discovery)
+is Kubernetes. This stage is **pure packaging** — not one line of application code
+changes, which is itself the point: the hexagonal app was always deployment-agnostic.
+
+**Why Helm, not raw manifests:** a chart is a *templated, versioned* package.
+One `values.yaml` drives dev vs prod (replica counts, resources, whether to run
+the dev stores or point at managed services) without copy-pasting YAML. It's the
+de-facto standard for shipping k8s apps.
+
+### 5J.1 `Chart.yaml` + `values.yaml`
+- `Chart.yaml` separates the **chart version** (bump on template changes) from
+  **appVersion** (the image the templates target). `values.yaml` is the single
+  surface of knobs: image, per-component replicas/resources, the config/secret
+  values, the HPA, and the `backingServices` toggle.
+
+### 5J.2 `templates/_helpers.tpl` — names + labels
+- `cosmos.fullname` prefixes every object with the release name (two installs
+  can coexist), and `cosmos.selectorLabels` emits the **stable** label set a
+  Deployment selects on (excluding version/chart, which change on upgrade — a
+  Deployment's selector is immutable, so it must not include churny labels).
+
+### 5J.3 `templates/configmap.yaml` — non-secret config
+- Renders the 12-factor env into a ConfigMap. The clever bit: connection URLs
+  **default to the in-cluster Service DNS names** (`<release>-postgres:5432`, …)
+  computed from the release name, but each is overridable — so the same chart
+  targets the bundled dev stores or external managed services with a `--set`.
+  `WORKER_GRPC_TARGET` is likewise computed to the worker's Service, wiring
+  Stage 7's control plane through k8s DNS.
+
+### 5J.4 `templates/secret.yaml` — sensitive config
+- `ADMIN_TOKEN`, the JWT secret, and provider keys go in a Secret (via
+  `stringData`, so we write plaintext and k8s encodes it). `secrets.create=false`
+  + `existingSecret` lets prod supply an externally-managed Secret (Sealed
+  Secrets / External Secrets / cloud store) instead — the honest production path.
+
+### 5J.5 `templates/gateway-*.yaml` — Deployment + Service + HPA
+- The Deployment `envFrom` both the ConfigMap and Secret; **liveness** hits
+  `/healthz` (is the process alive?) and **readiness** hits `/readyz` (can it
+  serve? — checks deps), so a pod that loses its DB is pulled from the Service
+  without being killed. **Checksum annotations** on the pod template roll the
+  pods when config/secret content changes (otherwise a ConfigMap edit wouldn't
+  restart anything). When the **HPA** is enabled the Deployment omits `replicas`
+  (so it doesn't fight the autoscaler); the HPA scales on CPU utilisation.
+
+### 5J.6 `templates/worker-*.yaml`
+- The worker runs the **same image** with `command: python -m app.worker`. It has
+  no HTTP surface, so readiness is a **TCP check on the gRPC port** ("is the
+  control plane accepting connections?"). Its Service is what
+  `WORKER_GRPC_TARGET` resolves to.
+
+### 5J.7 `templates/{postgres,redis,mongo,redpanda}.yaml` — dev stores
+- Single-replica Deployments (+ PVCs for the stateful ones) so `helm install`
+  yields a runnable stack on a laptop. All gated by `backingServices.enabled`;
+  Postgres/Mongo use `strategy: Recreate` because one RWO PVC can't attach to two
+  pods during a rolling update. **In prod you disable these** and point the
+  config URLs at real managed services — the gateway/worker templates are
+  untouched.
+
+> **Honest scope:** these bundled stores are for dev/demo — single replica, no
+> backups, no HA. Production databases belong to StatefulSets with proper storage
+> or (better) managed services; that's exactly why they're behind a toggle.
+
+---
+
 ## 6. Cross-cutting design decisions & trade-offs
 
 | Decision | Why | Trade-off / later fix |
@@ -1074,6 +1144,13 @@ Choosing the right communication style per concern is the whole lesson here.
 | gRPC client/server behind a port (lazy) | tests need no grpc; adapter swappable | real path only exercised in Docker/e2e |
 | Generated stubs built, not committed | git stays clean; stubs match the runtime | fresh local run needs codegen first |
 | Worker unreachable → 503, gRPC start best-effort | honest failure; data plane never blocked on control plane | status can be briefly unavailable after boot |
+| Helm chart (templated) over raw manifests | one values surface drives dev vs prod; versioned package | Helm templating to learn/maintain |
+| Config in ConfigMap, secrets in Secret | 12-factor; secrets managed/rotated separately | Secret still needs a real backend in prod |
+| readiness `/readyz` vs liveness `/healthz` | a dep-less pod leaves the Service, isn't killed | must keep readiness honest about deps |
+| Checksum annotations roll pods on config change | edits actually take effect | every config change restarts pods |
+| HPA owns replicas (Deployment omits them) | autoscaler and chart don't fight | manual scaling needs the HPA off |
+| Bundled dev stores behind a toggle | one-command runnable stack | not HA/backed-up → managed services in prod |
+| App code unchanged for k8s | proves the app was deployment-agnostic | packaging complexity moves to the chart |
 | LLM behind a port + scripted fake | tests run with no key/network/cost | one more abstraction layer |
 | Agent guardrails (token budget, max steps) | bound cost + prevent infinite loops | may stop before a hard task finishes |
 | SSE via Redis pub/sub | live progress across processes | live-only (no replay) until Stage 5-style history stream |
@@ -1401,6 +1478,35 @@ The gRPC call fails and the route maps it to a clean **503 `service_unavailable`
 it can't start, the worker logs it and keeps processing jobs — the data plane
 never depends on the control plane.
 
+**Q: How do you deploy this to Kubernetes? (Stage 8)**
+A Helm chart (`deploy/helm/cosmos`). The gateway and worker are Deployments of
+the same image with different commands; a Service fronts each; the gateway has an
+HPA. Config splits into a ConfigMap (non-secret) and a Secret, both consumed via
+`envFrom`. Dev backing stores ship as toggleable single-replica Deployments. No
+application code changed — the hexagonal app was already deployment-agnostic;
+Kubernetes is just how it's run.
+
+**Q: Liveness vs readiness — why two probes?**
+Liveness (`/healthz`) answers "is the process alive?"; if it fails, k8s
+**restarts** the pod. Readiness (`/readyz`) answers "can it serve requests right
+now?" — it checks dependencies; if it fails, k8s **removes the pod from the
+Service** but leaves it running. So a transient DB blip takes a pod out of
+rotation instead of triggering a pointless restart loop. The worker has no HTTP,
+so its readiness is a TCP check on the gRPC port.
+
+**Q: How does one chart serve both dev and prod?**
+`values.yaml`. `backingServices.enabled=true` runs bundled Postgres/Redis/Mongo/
+Redpanda for a laptop; set it `false` and point `config.*Url` at managed services
+for prod — the gateway/worker templates don't change. Replica counts, resources,
+the HPA, and `secrets.create=false`+`existingSecret` are all values too. That's
+the whole reason to template with Helm rather than hand-maintain manifests.
+
+**Q: Why the checksum annotations on the pod template?**
+Editing a ConfigMap or Secret doesn't restart anything on its own — pods read env
+at start. Stamping a `sha256sum` of the rendered config/secret into the pod
+template annotations changes the template on every content change, so a
+`helm upgrade` performs a rolling restart and the new config actually takes effect.
+
 ## 8. Known gaps and what later stages fix
 - **MongoDB trajectories + Redis hot state** (polyglot) → **Stage 2**. ✅ done
 - **Multi-store consistency** (Mongo+Postgres+Redis not atomic) → transactional **outbox + CDC**, **Stage 5**.
@@ -1421,7 +1527,10 @@ never depends on the control plane.
 - **RS256 + JWKS** (verify tokens from a real OIDC provider, not just HS256) → Stage 7 later increment (slots into `decode_and_verify`).
 - **Read-only / scoped API keys** and **key rotation/expiry** → later (API keys are full-access today).
 - **Typed gRPC control-plane contract** (gateway↔worker status/health) → **Stage 7 part 2**. ✅ done
-- **Rewrite the worker in Go** behind the same proto, **mutual-TLS**, **service mesh** → Stage 8+.
+- **Rewrite the worker in Go** behind the same proto, **mutual-TLS**, **service mesh** → later.
+- **Kubernetes packaging** (Helm chart: gateway+worker+stores, ConfigMap/Secret, probes, HPA) → **Stage 8 part 1**. ✅ done
+- **Custom operator + CRD** (`CosmosTenant` reconciled to provision tenants/keys) → **Stage 8 part 2**.
+- **Production storage** (StatefulSets/managed DBs, backups, HA), **Ingress/TLS**, **NetworkPolicies**, **PodDisruptionBudgets** → hardening increments.
 - **Per-tenant rate limits** (reuse the Stage-4 bucket keyed by tenant) → small follow-on.
 - **Quota check + usage record aren't atomic** (tiny overshoot under bursts) → acceptable for a coarse monthly quota; a stricter limit would reserve-then-commit.
 
@@ -1460,3 +1569,9 @@ never depends on the control plane.
 - **codegen / stub** — generated client/server code from the `.proto` (the `*_pb2*.py` files).
 - **data plane vs control plane** — the path that carries the work (async queue) vs the path that manages/observes it (sync gRPC).
 - **servicer / stub** — the server-side implementation of a gRPC service vs the client-side proxy that calls it.
+- **Helm / chart / values** — the k8s package manager; a templated bundle of manifests; the file of overridable knobs driving them.
+- **ConfigMap / Secret** — k8s objects holding non-secret / secret configuration, injected into pods as env or files.
+- **liveness / readiness probe** — "restart me if I'm dead" vs "take me out of the Service until I can serve".
+- **HPA (HorizontalPodAutoscaler)** — scales replica count on a metric (here gateway CPU).
+- **PVC (PersistentVolumeClaim)** — a pod's request for durable storage (used by the stateful dev stores).
+- **operator / CRD** — a custom controller that reconciles a Custom Resource toward desired state (Stage 8 pt2).
