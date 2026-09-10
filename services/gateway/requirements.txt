@@ -10,6 +10,8 @@ motor==3.6.0
 aiokafka==0.12.0   # Kafka/Redpanda client for the event backbone (Stage 5)
 anthropic>=0.69
 groq>=0.11         # free-tier alternative LLM provider (LLM_PROVIDER=groq)
+grpcio==1.68.1        # gRPC runtime for the gateway<->worker control plane (Stage 7 pt2)
+grpcio-tools==1.68.1  # protoc + plugins to generate stubs from proto/ (build-time)
 
 # --- tests (fine to keep here for a learning project; split into
 #     requirements-dev.txt later if you want a lean runtime image) ---

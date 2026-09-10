@@ -85,6 +85,8 @@ services:
       JWT_HS256_SECRET: ${JWT_HS256_SECRET:-}
       JWT_ISSUER: ${JWT_ISSUER:-}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-}
+      # Stage 7 pt2: where the gateway reaches the worker's gRPC control plane.
+      WORKER_GRPC_TARGET: ${WORKER_GRPC_TARGET:-worker:50051}
     ports:
       - "8000:8000"
     depends_on:
@@ -122,6 +124,10 @@ services:
       BREAKER_RESET_S: ${BREAKER_RESET_S:-30}
       # Stage 5: event backbone the outbox relay publishes to.
       REDPANDA_BROKERS: ${REDPANDA_BROKERS:-redpanda:9092}
+      # Stage 7 pt2: port the worker's gRPC control plane binds.
+      WORKER_GRPC_PORT: ${WORKER_GRPC_PORT:-50051}
+    ports:
+      - "50051:50051"          # gRPC control plane (for grpcurl/debugging)
     depends_on:
       postgres:
         condition: service_healthy
