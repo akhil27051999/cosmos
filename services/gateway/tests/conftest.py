@@ -21,8 +21,9 @@ from __future__ import annotations
 import os
 
 # Must be set BEFORE anything imports app.core.config (main.py reads settings at
-# import time). Enables the admin API in tests with a known shared secret.
+# import time). Enable the admin API and JWT auth in tests with known secrets.
 os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
+os.environ.setdefault("JWT_HS256_SECRET", "test-jwt-secret")
 
 from types import SimpleNamespace
 
@@ -96,7 +97,8 @@ async def env():
         cache=cache, bus=bus, outbox=outbox, event_bus=event_bus,
         read_model=read_model, identity=identity, usage=usage, service=service,
         limiter=limiter, tenant_id=tenant.id, api_key=api_key,
-        admin_token=os.environ["ADMIN_TOKEN"], app=app,
+        admin_token=os.environ["ADMIN_TOKEN"],
+        jwt_secret=os.environ["JWT_HS256_SECRET"], app=app,
     )
 
     # Point every provider at the shared in-memory instances.
