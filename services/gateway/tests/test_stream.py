@@ -42,7 +42,7 @@ async def test_bus_fans_out_to_a_subscriber():
 
 async def test_worker_runs_agent_streams_and_stores_trajectory(env):
     # a job to process
-    job, _ = await env.service.submit({"prompt": "double 21"}, None)
+    job, _ = await env.service.submit({"prompt": "double 21"}, None, env.tenant_id)
 
     # scripted agent: call the calculator, then answer
     llm = ScriptedLLMClient([

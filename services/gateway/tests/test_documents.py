@@ -27,7 +27,7 @@ async def test_submit_stores_payload_in_document_store(env):
 
 
 async def test_worker_writes_result_document(env):
-    job, _ = await env.service.submit({"n": 21}, None)
+    job, _ = await env.service.submit({"n": 21}, None, env.tenant_id)
 
     # A fast stand-in for the real work: read payload, write a result document.
     async def work(j):

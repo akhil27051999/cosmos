@@ -28,7 +28,7 @@ async def _event_types(env, job_id):
 
 
 async def test_pending_job_runs_to_succeeded(env):
-    job, _ = await env.service.submit({"task": "x"}, None)
+    job, _ = await env.service.submit({"task": "x"}, None, env.tenant_id)
 
     result = await process_job(job.id, repo=env.repo, events=env.events, work_fn=_noop_work)
 
@@ -39,7 +39,7 @@ async def test_pending_job_runs_to_succeeded(env):
 
 
 async def test_redelivery_is_idempotent(env):
-    job, _ = await env.service.submit({"task": "x"}, None)
+    job, _ = await env.service.submit({"task": "x"}, None, env.tenant_id)
 
     first = await process_job(job.id, repo=env.repo, events=env.events, work_fn=_noop_work)
     second = await process_job(job.id, repo=env.repo, events=env.events, work_fn=_noop_work)
@@ -51,7 +51,7 @@ async def test_redelivery_is_idempotent(env):
 
 
 async def test_cancel_before_pickup_is_skipped(env):
-    job, _ = await env.service.submit({"task": "x"}, None)
+    job, _ = await env.service.submit({"task": "x"}, None, env.tenant_id)
     await env.service.cancel(job.id)                 # cancelled while still PENDING
 
     result = await process_job(job.id, repo=env.repo, events=env.events, work_fn=_noop_work)
@@ -63,7 +63,7 @@ async def test_cancel_before_pickup_is_skipped(env):
 
 
 async def test_work_failure_marks_failed(env):
-    job, _ = await env.service.submit({"task": "x"}, None)
+    job, _ = await env.service.submit({"task": "x"}, None, env.tenant_id)
 
     async def boom(job):
         raise RuntimeError("provider exploded")
