@@ -86,7 +86,20 @@ backingServices:
   redpanda:
     image: redpandadata/redpanda:v24.2.7
 
-# Pod hardening applied to gateway + worker.
+# Stage 8 pt2 — the CosmosTenant operator (CRD + controller). Provisions tenants
+# via the gateway admin API when you `kubectl apply` a CosmosTenant. Its image is
+# built from services/operator (separate from the app image — it needs kopf).
+operator:
+  enabled: true
+  image:
+    repository: cosmos-operator
+    tag: latest
+    pullPolicy: IfNotPresent
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 250m, memory: 256Mi }
+
+# Pod hardening applied to gateway + worker (+ operator).
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 1000

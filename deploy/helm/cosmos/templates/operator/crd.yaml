@@ -1,0 +1,61 @@
+{{- if .Values.operator.enabled }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: cosmostenants.cosmos.dev
+  labels: {{- include "cosmos.labels" . | nindent 4 }}
+spec:
+  group: cosmos.dev
+  scope: Namespaced
+  names:
+    kind: CosmosTenant
+    plural: cosmostenants
+    singular: cosmostenant
+    shortNames: ["ctenant"]
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      # status is a subresource so the operator can patch status independently
+      # of spec (and users can't accidentally edit it).
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: ["displayName"]
+              properties:
+                displayName:
+                  type: string
+                  description: Human-readable tenant name passed to the admin API.
+                monthlyQuota:
+                  type: integer
+                  minimum: 1
+                  description: Submissions/month; omit to use the server default.
+            status:
+              type: object
+              # The operator writes these; allow unknown keys defensively.
+              x-kubernetes-preserve-unknown-fields: true
+              properties:
+                phase: { type: string }
+                tenantId: { type: string }
+                keyPrefix: { type: string }
+                monthlyQuota: { type: integer }
+                secretName: { type: string }
+      additionalPrinterColumns:
+        - name: Display Name
+          type: string
+          jsonPath: .spec.displayName
+        - name: Tenant
+          type: string
+          jsonPath: .status.tenantId
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+{{- end }}

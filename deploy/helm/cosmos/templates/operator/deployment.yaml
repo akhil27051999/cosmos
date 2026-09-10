@@ -1,0 +1,40 @@
+{{- if .Values.operator.enabled }}
+{{- $fn := include "cosmos.fullname" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fn }}-operator
+  labels:
+    {{- include "cosmos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+spec:
+  replicas: 1                 # --standalone kopf: exactly one instance
+  selector:
+    matchLabels:
+      {{- include "cosmos.selectorLabels" (dict "ctx" . "component" "operator") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cosmos.selectorLabels" (dict "ctx" . "component" "operator") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ $fn }}-operator
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: operator
+          image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag }}"
+          imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
+          env:
+            # Only watch this release's namespace.
+            - name: WATCH_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            # Reach the gateway admin API by its in-cluster Service.
+            - name: GATEWAY_ADMIN_URL
+              value: {{ printf "http://%s-gateway:%v" $fn .Values.gateway.service.port | quote }}
+            # The same admin token the gateway validates (from the shared Secret).
+            - name: ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "cosmos.secretName" . }}
+                  key: ADMIN_TOKEN
+          resources: {{- toYaml .Values.operator.resources | nindent 12 }}
+{{- end }}

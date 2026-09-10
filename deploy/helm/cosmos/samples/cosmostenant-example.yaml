@@ -1,0 +1,14 @@
+# An example CosmosTenant. `kubectl apply -f` this and the operator provisions the
+# tenant via the gateway admin API, then writes its credentials into a Secret
+# named "<name>-credentials" and records the tenant id in .status.
+#
+#   kubectl -n cosmos apply -f cosmostenant-example.yaml
+#   kubectl -n cosmos get cosmostenants          # watch PHASE go to Ready + TENANT fill in
+#   kubectl -n cosmos get secret acme-credentials -o jsonpath='{.data.api_key}' | base64 -d
+apiVersion: cosmos.dev/v1
+kind: CosmosTenant
+metadata:
+  name: acme
+spec:
+  displayName: Acme Corp
+  monthlyQuota: 500
