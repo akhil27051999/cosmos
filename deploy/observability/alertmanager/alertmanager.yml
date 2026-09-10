@@ -1,0 +1,12 @@
+# Minimal Alertmanager — routes everything to a single receiver. There's no
+# external integration (Slack/PagerDuty) on purpose; for a local test you watch
+# alerts fire in the Alertmanager UI (:9093) and on Prometheus /alerts (:9090).
+# Add a Slack/webhook receiver here to test real notification delivery.
+route:
+  receiver: default
+  group_wait: 10s
+  group_interval: 30s
+  repeat_interval: 1h
+
+receivers:
+  - name: default

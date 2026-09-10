@@ -1,0 +1,36 @@
+# Alert rules over the RED metrics — these fire when you turn on the Stage-12
+# chaos injector, which is the point: prove the alerting path end to end.
+groups:
+  - name: cosmos-slo
+    rules:
+      # Error rate > 5% over the last minute (chaos with fault_rate>=0.3 trips this).
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[1m]))
+            / sum(rate(http_requests_total[1m])) > 0.05
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "Cosmos gateway error rate > 5%"
+          description: "5xx share is {{ $value | humanizePercentage }} over 1m."
+
+      # p95 request latency over 0.5s for 2m (chaos latency_ms trips this).
+      - alert: HighLatencyP95
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(http_request_duration_seconds_bucket[5m]))) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cosmos gateway p95 latency > 500ms"
+
+      # The gateway scrape target is down.
+      - alert: GatewayDown
+        expr: up{job="cosmos-gateway"} == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "Cosmos gateway is not being scraped (down?)"
