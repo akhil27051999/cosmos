@@ -42,6 +42,7 @@ from app.adapters.memory.repository import InMemoryJobRepository
 from app.adapters.memory.stream_bus import InMemoryStreamBus
 from app.adapters.memory.experiment_store import InMemoryExperimentStore
 from app.adapters.memory.exposure_log import InMemoryExposureLog
+from app.adapters.memory.saga_store import InMemorySagaStore
 from app.adapters.memory.usage_ledger import InMemoryUsageLedger
 from app.adapters.memory.worker_control import InMemoryWorkerControlClient
 from app.api.deps import (
@@ -57,6 +58,7 @@ from app.api.deps import (
     get_job_service,
     get_outbox_writer,
     get_read_model_store,
+    get_saga_store,
     get_stream_bus,
     get_submit_rate_limiter,
     get_usage_ledger,
@@ -91,6 +93,7 @@ async def env():
     experiment_store = InMemoryExperimentStore()
     exposure_log = InMemoryExposureLog()
     experiments = ExperimentService(experiment_store, exposure_log)
+    saga_store = InMemorySagaStore()
 
     # Seed one tenant + a real API key. The plaintext is what the client sends;
     # the store holds only the hash (as in production).
@@ -113,7 +116,7 @@ async def env():
         jwt_secret=os.environ["JWT_HS256_SECRET"],
         worker_control=worker_control,
         experiment_store=experiment_store, exposure_log=exposure_log,
-        experiments=experiments, app=app,
+        experiments=experiments, saga_store=saga_store, app=app,
     )
 
     # Point every provider at the shared in-memory instances.
@@ -131,6 +134,7 @@ async def env():
     app.dependency_overrides[get_experiment_store] = lambda: experiment_store
     app.dependency_overrides[get_exposure_log] = lambda: exposure_log
     app.dependency_overrides[get_experiment_service] = lambda: experiments
+    app.dependency_overrides[get_saga_store] = lambda: saga_store
     app.dependency_overrides[get_job_service] = lambda: service
     # Read the limiter off the namespace each call, so a test can swap it.
     app.dependency_overrides[get_submit_rate_limiter] = lambda: ns.limiter
