@@ -23,7 +23,10 @@ from app.adapters.postgres.read_model import PostgresReadModel
 from app.adapters.postgres.repository import PostgresJobRepository
 from app.adapters.postgres.usage_ledger import PostgresUsageLedger
 from app.application.job_service import JobService
+from app.auth.jwt import JWTError, decode_and_verify
 from app.auth.keys import parse_api_key, verify_secret
+from app.auth.scopes import ALL as ALL_SCOPES
+from app.auth.scopes import parse_scopes
 from app.core.db import get_sessionmaker
 from app.domain.exceptions import Forbidden, Unauthenticated
 from app.domain.identity import Principal
@@ -115,13 +118,22 @@ async def get_principal(
 ) -> Principal:
     """AUTHENTICATE the request -> a Principal, or raise (401/403).
 
-    The single choke point every protected route depends on. It verifies the
-    presented API key against the stored hash, then confirms the owning tenant is
-    active. Routes then scope everything to `principal.tenant_id`.
+    The single choke point every protected route depends on, now supporting TWO
+    credential schemes on the same `Authorization: Bearer` header:
+      * an **API key** (`csk_...`) — Stage 6, full-access to its tenant;
+      * an **OAuth2/OIDC JWT** — Stage 7, scoped by its `scope` claim.
+    We tell them apart by the `csk_` prefix (API keys), else parse as a JWT. Both
+    resolve to the same `Principal`, so routes don't care which was used.
     """
     raw = _extract_key(authorization, x_api_key)
     if raw is None:
-        raise Unauthenticated("missing API key")
+        raise Unauthenticated("missing credentials")
+    if raw.startswith("csk_"):
+        return await _principal_from_api_key(raw, identity)
+    return await _principal_from_jwt(raw, identity)
+
+
+async def _principal_from_api_key(raw: str, identity: IdentityStore) -> Principal:
     parsed = parse_api_key(raw)
     if parsed is None:
         raise Unauthenticated("malformed API key")
@@ -136,7 +148,58 @@ async def get_principal(
     tenant = await identity.get_tenant(key.tenant_id)
     if tenant is None or not tenant.is_active:
         raise Forbidden("tenant is not active")
-    return Principal(tenant_id=key.tenant_id, key_id=key_id)
+    # An API key is a tenant's root credential -> full scopes.
+    return Principal(tenant_id=key.tenant_id, key_id=key_id, scopes=ALL_SCOPES,
+                     credential="api_key")
+
+
+async def _principal_from_jwt(raw: str, identity: IdentityStore) -> Principal:
+    from app.core.config import get_settings
+
+    s = get_settings()
+    if not s.jwt_hs256_secret:
+        # JWT auth isn't configured -> we only accept API keys. Don't imply the
+        # token was "wrong"; it's simply not a scheme we recognise here.
+        raise Unauthenticated("unrecognised credential")
+    try:
+        claims = decode_and_verify(
+            raw,
+            secret=s.jwt_hs256_secret,
+            issuer=s.jwt_issuer or None,
+            audience=s.jwt_audience or None,
+            leeway=s.jwt_leeway_s,
+        )
+    except JWTError as exc:
+        raise Unauthenticated("invalid token") from exc
+
+    tenant_id = claims.get(s.jwt_tenant_claim)
+    if not tenant_id:
+        raise Unauthenticated(f"token missing '{s.jwt_tenant_claim}' claim")
+
+    tenant = await identity.get_tenant(tenant_id)
+    if tenant is None or not tenant.is_active:
+        raise Forbidden("tenant is not active")
+
+    scopes = parse_scopes(claims.get(s.jwt_scope_claim))
+    # `sub` is the OIDC subject (the end-user/service id) — record it as key_id.
+    return Principal(tenant_id=tenant_id, key_id=str(claims.get("sub", "jwt")),
+                     scopes=scopes, credential="jwt")
+
+
+def require_scope(scope: str):
+    """Build a dependency that authenticates AND checks the caller holds `scope`.
+
+    Usage in a route:  `principal: Principal = Depends(require_scope(JOBS_WRITE))`.
+    Authentication (401) happens first via `get_principal`; then a missing scope
+    is a 403 — the authorization gate, distinct from authentication.
+    """
+
+    async def _dep(principal: Principal = Depends(get_principal)) -> Principal:
+        if not principal.has_scope(scope):
+            raise Forbidden(f"missing required scope '{scope}'")
+        return principal
+
+    return _dep
 
 
 async def require_admin(

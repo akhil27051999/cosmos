@@ -71,6 +71,17 @@ class Settings(BaseSettings):
     # Default monthly submission quota given to a new tenant when none is set.
     default_monthly_quota: int = 1000
 
+    # Stage 7 — OAuth2/OIDC bearer tokens (JWT) as a SECOND credential scheme.
+    # Local/testing verifies HS256 with this shared secret; BLANK => JWT auth is
+    # disabled and only API keys are accepted. (Production would verify RS256 via
+    # an OIDC provider's JWKS — a later increment.)
+    jwt_hs256_secret: str = ""                  # from JWT_HS256_SECRET
+    jwt_issuer: str = ""                        # expected `iss` (blank => not checked)
+    jwt_audience: str = ""                      # expected `aud` (blank => not checked)
+    jwt_tenant_claim: str = "tenant_id"         # claim carrying the tenant id
+    jwt_scope_claim: str = "scope"              # OAuth2 space-delimited scope claim
+    jwt_leeway_s: int = 60                      # clock-skew allowance (seconds)
+
     log_level: str = "INFO"
 
 
