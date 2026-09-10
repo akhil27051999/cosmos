@@ -1,0 +1,41 @@
+# ArgoCD Application — GitOps for Cosmos.
+#
+# ArgoCD watches this Git repo's Helm chart and keeps the cluster in sync with it.
+# `automated` + `selfHeal` means: commit a change to deploy/helm/cosmos on main and
+# ArgoCD applies it; hand-edit the cluster and ArgoCD reverts the drift.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cosmos
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/akhil27051999/cosmos.git
+    targetRevision: main
+    path: deploy/helm/cosmos
+    helm:
+      # Override chart values here (this is your GitOps config surface). For a real
+      # cluster, source secrets from a SecretGenerator / External Secrets instead
+      # of inlining them.
+      valuesObject:
+        secrets:
+          adminToken: "change-me-in-git"
+          jwtHs256Secret: "change-me-in-git"
+        # local images loaded into minikube; don't try to pull from a registry
+        image:
+          pullPolicy: IfNotPresent
+        operator:
+          enabled: true
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cosmos
+
+  syncPolicy:
+    automated:
+      prune: true       # delete resources removed from git
+      selfHeal: true    # revert manual drift back to git state
+    syncOptions:
+      - CreateNamespace=true
