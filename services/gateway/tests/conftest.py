@@ -40,11 +40,16 @@ from app.adapters.memory.queue import InMemoryJobQueue
 from app.adapters.memory.read_model import InMemoryReadModel
 from app.adapters.memory.repository import InMemoryJobRepository
 from app.adapters.memory.stream_bus import InMemoryStreamBus
+from app.adapters.memory.experiment_store import InMemoryExperimentStore
+from app.adapters.memory.exposure_log import InMemoryExposureLog
 from app.adapters.memory.usage_ledger import InMemoryUsageLedger
 from app.adapters.memory.worker_control import InMemoryWorkerControlClient
 from app.api.deps import (
     get_document_store,
     get_event_store,
+    get_experiment_service,
+    get_experiment_store,
+    get_exposure_log,
     get_identity_store,
     get_job_cache,
     get_job_queue,
@@ -57,6 +62,7 @@ from app.api.deps import (
     get_usage_ledger,
     get_worker_control,
 )
+from app.application.experiment_service import ExperimentService
 from app.application.job_service import JobService
 from app.auth.keys import generate_api_key
 from app.core.config import get_settings
@@ -82,6 +88,9 @@ async def env():
     identity = InMemoryIdentityStore()
     usage = InMemoryUsageLedger()
     worker_control = InMemoryWorkerControlClient()
+    experiment_store = InMemoryExperimentStore()
+    exposure_log = InMemoryExposureLog()
+    experiments = ExperimentService(experiment_store, exposure_log)
 
     # Seed one tenant + a real API key. The plaintext is what the client sends;
     # the store holds only the hash (as in production).
@@ -102,7 +111,9 @@ async def env():
         limiter=limiter, tenant_id=tenant.id, api_key=api_key,
         admin_token=os.environ["ADMIN_TOKEN"],
         jwt_secret=os.environ["JWT_HS256_SECRET"],
-        worker_control=worker_control, app=app,
+        worker_control=worker_control,
+        experiment_store=experiment_store, exposure_log=exposure_log,
+        experiments=experiments, app=app,
     )
 
     # Point every provider at the shared in-memory instances.
@@ -117,6 +128,9 @@ async def env():
     app.dependency_overrides[get_identity_store] = lambda: identity
     app.dependency_overrides[get_usage_ledger] = lambda: usage
     app.dependency_overrides[get_worker_control] = lambda: worker_control
+    app.dependency_overrides[get_experiment_store] = lambda: experiment_store
+    app.dependency_overrides[get_exposure_log] = lambda: exposure_log
+    app.dependency_overrides[get_experiment_service] = lambda: experiments
     app.dependency_overrides[get_job_service] = lambda: service
     # Read the limiter off the namespace each call, so a test can swap it.
     app.dependency_overrides[get_submit_rate_limiter] = lambda: ns.limiter
