@@ -20,8 +20,11 @@ from fastapi.responses import JSONResponse
 from app.core.correlation import get_correlation_id
 from app.domain.exceptions import (
     DomainError,
+    Forbidden,
     InvalidTransition,
     JobNotFound,
+    QuotaExceeded,
+    Unauthenticated,
     VersionConflict,
 )
 from app.resilience.errors import RateLimited
@@ -45,6 +48,10 @@ _DOMAIN_MAP: dict[type[DomainError], tuple[int, str]] = {
     JobNotFound: (404, "job_not_found"),
     InvalidTransition: (409, "invalid_transition"),
     VersionConflict: (409, "version_conflict"),
+    # Stage 6 — identity / multi-tenancy.
+    Unauthenticated: (401, "unauthenticated"),
+    Forbidden: (403, "forbidden"),
+    QuotaExceeded: (429, "quota_exceeded"),
 }
 
 
@@ -54,7 +61,14 @@ def install_error_handlers(app: FastAPI) -> None:
         # Look up the specific subclass; fall back to 400 for any new domain
         # error we haven't explicitly mapped yet.
         status_code, code = _DOMAIN_MAP.get(type(exc), (400, "domain_error"))
-        return _envelope(status_code, code, str(exc))
+        resp = _envelope(status_code, code, str(exc))
+        # RFC 7235: a 401 SHOULD say how to authenticate. We use a bearer API key.
+        if status_code == 401:
+            resp.headers["WWW-Authenticate"] = "Bearer"
+        # A quota 429 gets a Retry-After like the load-shed 429 does.
+        if isinstance(exc, QuotaExceeded):
+            resp.headers["Retry-After"] = "3600"
+        return resp
 
     @app.exception_handler(RateLimited)
     async def _handle_rate_limited(_: Request, exc: RateLimited) -> JSONResponse:

@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.domain.document import JobDocument
 from app.domain.events import JobEvent, JobEventType
 from app.domain.job import Job, JobStatus
+from app.domain.read_model import ReadModelEntry
 
 
 class JobCreate(BaseModel):
@@ -57,12 +58,31 @@ class JobDocumentOut(BaseModel):
         return cls.model_validate(doc)
 
 
+class JobViewOut(BaseModel):
+    """The CQRS read-model projection of a job (GET /v1/jobs/{id}/view)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    job_id: uuid.UUID
+    tenant_id: str
+    status: JobStatus
+    version: int
+    event_count: int
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_entity(cls, entry: ReadModelEntry) -> "JobViewOut":
+        return cls.model_validate(entry)
+
+
 class JobOut(BaseModel):
     """Response body representing a job."""
 
     model_config = ConfigDict(from_attributes=True)  # allow building from an object
 
     id: uuid.UUID
+    tenant_id: str
     status: JobStatus
     version: int
     idempotency_key: str | None
@@ -72,3 +92,38 @@ class JobOut(BaseModel):
     @classmethod
     def from_entity(cls, job: Job) -> "JobOut":
         return cls.model_validate(job)
+
+
+# ---- Stage 6: admin bootstrap DTOs --------------------------------------
+
+
+class TenantCreate(BaseModel):
+    """Request body for POST /v1/admin/tenants."""
+
+    name: str = Field(..., min_length=1, description="human-readable tenant name")
+    monthly_quota: int | None = Field(
+        default=None, ge=1, description="submissions/month; omit for the server default"
+    )
+
+
+class ApiKeyCreated(BaseModel):
+    """The one-time reveal of a freshly minted API key.
+
+    `api_key` is shown exactly ONCE — it isn't stored in plaintext and cannot be
+    retrieved again. `key_prefix` is the safe, displayable identifier that lives
+    in the DB.
+    """
+
+    tenant_id: str
+    key_prefix: str
+    api_key: str = Field(..., description="the full secret — store it now; shown only once")
+
+
+class TenantCreated(BaseModel):
+    """Response for POST /v1/admin/tenants — the tenant plus its first key."""
+
+    tenant_id: str
+    name: str
+    monthly_quota: int
+    key_prefix: str
+    api_key: str = Field(..., description="the full secret — store it now; shown only once")

@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     mongo_url: str = "mongodb://localhost:27017"
     mongo_db: str = "cosmos"
 
+    # Redpanda/Kafka event backbone — Stage 5 (the outbox relay publishes here).
+    redpanda_brokers: str = "localhost:19092"
+
     # Stage 3 — the agent layer.
     # Pick the model provider: "anthropic" (default) or "groq" (free tier).
     llm_provider: str = "anthropic"
@@ -60,6 +63,13 @@ class Settings(BaseSettings):
     # Stage 4 — edge load-shedding (admission control on POST /v1/jobs).
     submit_rate_per_sec: float = 20.0           # sustained submissions/sec
     submit_burst: int = 40                      # bucket capacity (short bursts)
+
+    # Stage 6 — multi-tenancy & identity.
+    # Shared secret guarding the admin bootstrap endpoints (create tenants/keys).
+    # BLANK disables the admin API entirely (a missing secret must not mean "open").
+    admin_token: str = ""                       # from ADMIN_TOKEN
+    # Default monthly submission quota given to a new tenant when none is set.
+    default_monthly_quota: int = 1000
 
     log_level: str = "INFO"
 
