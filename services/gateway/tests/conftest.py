@@ -76,6 +76,11 @@ from app.resilience.rate_limiter import TokenBucket
 @pytest_asyncio.fixture
 async def env():
     get_settings.cache_clear()  # pick up ADMIN_TOKEN set above
+    # Reset process-global reliability state so tests don't contaminate each other.
+    from app.core import lifecycle
+    from app.observability import chaos
+    lifecycle.reset_draining()
+    chaos.configure(False)
     app = create_app()
 
     repo = InMemoryJobRepository()
