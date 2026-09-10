@@ -37,6 +37,7 @@ from app.application.job_service import JobService
 from app.auth.scopes import JOBS_READ, JOBS_WRITE
 from app.domain.exceptions import JobNotFound
 from app.domain.identity import Principal
+from app.observability.metrics import jobs_submitted_total
 from app.ports.cache import JobCache
 from app.ports.document_store import JobDocumentStore
 from app.ports.event_store import EventStore
@@ -70,6 +71,8 @@ async def submit_job(
     if not created:
         # idempotent replay of an already-accepted job
         response.status_code = status.HTTP_200_OK
+    else:
+        jobs_submitted_total.inc()   # a domain metric on /metrics
     return JobOut.from_entity(job)
 
 
