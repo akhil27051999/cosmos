@@ -82,8 +82,17 @@ class Principal:
 
     Immutable on purpose: once we've decided who you are, nothing downstream
     should be able to change it. Routes read `principal.tenant_id` to scope every
-    query and stamp every write, which is what enforces tenant isolation.
+    query and stamp every write (tenant isolation), and `principal.scopes` to
+    decide what the caller is allowed to DO (authorization, Stage 7).
+
+    `credential` records HOW the caller authenticated ("api_key" or "jwt") — handy
+    for audit logs and for reasoning about the two supported schemes.
     """
 
     tenant_id: str
     key_id: str
+    scopes: frozenset[str] = frozenset()
+    credential: str = "api_key"
+
+    def has_scope(self, scope: str) -> bool:
+        return scope in self.scopes
