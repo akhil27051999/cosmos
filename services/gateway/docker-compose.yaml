@@ -80,6 +80,11 @@ services:
       # before `up` to enable:  export ADMIN_TOKEN=dev-admin-secret
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
       DEFAULT_MONTHLY_QUOTA: ${DEFAULT_MONTHLY_QUOTA:-1000}
+      # Stage 7: OAuth2/OIDC JWT auth. Blank secret => JWT disabled (API keys only).
+      # export JWT_HS256_SECRET=dev-jwt-secret to accept HS256 bearer tokens.
+      JWT_HS256_SECRET: ${JWT_HS256_SECRET:-}
+      JWT_ISSUER: ${JWT_ISSUER:-}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-}
     ports:
       - "8000:8000"
     depends_on:
