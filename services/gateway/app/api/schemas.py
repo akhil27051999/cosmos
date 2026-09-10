@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain.document import JobDocument
 from app.domain.events import JobEvent, JobEventType
+from app.domain.experiment import ExperimentStatus
 from app.domain.job import Job, JobStatus
 from app.domain.read_model import ReadModelEntry
 
@@ -127,6 +128,60 @@ class TenantCreated(BaseModel):
     monthly_quota: int
     key_prefix: str
     api_key: str = Field(..., description="the full secret — store it now; shown only once")
+
+
+class VariantIn(BaseModel):
+    """One arm in a POST /v1/experiments request."""
+
+    name: str = Field(..., min_length=1)
+    weight: int = Field(1, ge=1, description="relative traffic share")
+    config: dict = Field(default_factory=dict, description="what this arm changes")
+
+
+class ExperimentCreate(BaseModel):
+    """Request body for POST /v1/experiments (admin)."""
+
+    key: str = Field(..., min_length=1, max_length=128, pattern=r"^[a-zA-Z0-9._-]+$")
+    description: str = ""
+    variants: list[VariantIn] = Field(..., min_length=1)
+
+
+class ExperimentStatusUpdate(BaseModel):
+    status: ExperimentStatus
+
+
+class VariantOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    name: str
+    weight: int
+    config: dict
+
+
+class ExperimentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    key: str
+    description: str
+    status: ExperimentStatus
+    variants: list[VariantOut]
+    created_at: datetime
+
+    @classmethod
+    def from_entity(cls, exp) -> "ExperimentOut":
+        return cls.model_validate(exp)
+
+
+class AssignmentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    experiment_key: str
+    unit_id: str
+    variant: str
+    config: dict
+
+    @classmethod
+    def from_entity(cls, a) -> "AssignmentOut":
+        return cls.model_validate(a)
 
 
 class WorkerStatusOut(BaseModel):

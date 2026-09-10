@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 from app.core.correlation import get_correlation_id
 from app.domain.exceptions import (
     DomainError,
+    ExperimentNotFound,
     Forbidden,
     InvalidTransition,
     JobNotFound,
@@ -47,6 +48,7 @@ def _envelope(status_code: int, code: str, message: str) -> JSONResponse:
 # Which domain error maps to which HTTP status + machine-readable code.
 _DOMAIN_MAP: dict[type[DomainError], tuple[int, str]] = {
     JobNotFound: (404, "job_not_found"),
+    ExperimentNotFound: (404, "experiment_not_found"),
     InvalidTransition: (409, "invalid_transition"),
     VersionConflict: (409, "version_conflict"),
     # Stage 6 — identity / multi-tenancy.

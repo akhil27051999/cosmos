@@ -18,7 +18,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api import routes_admin, routes_health, routes_jobs, routes_read
+from app.api import (
+    routes_admin,
+    routes_experiments,
+    routes_health,
+    routes_jobs,
+    routes_read,
+)
 from app.api.errors import install_error_handlers
 from app.core.config import get_settings
 from app.core.correlation import CorrelationIdMiddleware
@@ -55,6 +61,7 @@ def create_app() -> FastAPI:
     app.include_router(routes_jobs.router)
     app.include_router(routes_read.router)
     app.include_router(routes_admin.router)
+    app.include_router(routes_experiments.router)
 
     return app
 

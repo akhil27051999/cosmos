@@ -17,11 +17,14 @@ from fastapi import Depends, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.postgres.event_store import PostgresEventStore
+from app.adapters.postgres.experiment_store import PostgresExperimentStore
+from app.adapters.postgres.exposure_log import PostgresExposureLog
 from app.adapters.postgres.identity_store import PostgresIdentityStore
 from app.adapters.postgres.outbox import PostgresOutbox
 from app.adapters.postgres.read_model import PostgresReadModel
 from app.adapters.postgres.repository import PostgresJobRepository
 from app.adapters.postgres.usage_ledger import PostgresUsageLedger
+from app.application.experiment_service import ExperimentService
 from app.application.job_service import JobService
 from app.auth.jwt import JWTError, decode_and_verify
 from app.auth.keys import parse_api_key, verify_secret
@@ -38,6 +41,8 @@ from app.ports.job_queue import JobQueue
 from app.ports.job_repository import JobRepository
 from app.ports.outbox import OutboxWriter
 from app.ports.read_model import ReadModelStore
+from app.ports.experiment_store import ExperimentStore
+from app.ports.exposure_log import ExposureLog
 from app.ports.usage_ledger import UsageLedger
 from app.ports.worker_control import WorkerControlClient
 from app.resilience.rate_limiter import RateLimiter
@@ -99,6 +104,23 @@ def get_identity_store() -> IdentityStore:
 
 def get_usage_ledger() -> UsageLedger:
     return PostgresUsageLedger(get_sessionmaker())
+
+
+# ---- Stage 9: experimentation (A/B + feature flags) ---------------------
+
+def get_experiment_store() -> ExperimentStore:
+    return PostgresExperimentStore(get_sessionmaker())
+
+
+def get_exposure_log() -> ExposureLog:
+    return PostgresExposureLog(get_sessionmaker())
+
+
+def get_experiment_service(
+    store: ExperimentStore = Depends(get_experiment_store),
+    exposures: ExposureLog = Depends(get_exposure_log),
+) -> ExperimentService:
+    return ExperimentService(store, exposures)
 
 
 def _extract_key(authorization: str | None, x_api_key: str | None) -> str | None:
