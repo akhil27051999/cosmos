@@ -1,0 +1,51 @@
+20695dc  2026-08-13  docs: add project wiki (Home, 12 content pages, sidebar/footer)
+56c46ad  2026-08-06  fix: Cosmos-Roadmap.pdf was blank — defeat scroll-reveal in print export
+db676d2  2026-08-06  chore: remove stray root 'Desktop' file (stale pre-rebrand README copy)
+318c613  2026-08-06  chore: point all repo references at cosmos-llm-orchestration-platform
+f15dac9  2026-08-06  handoff: local folder renamed Flask-REST-API -> cosmos
+b89ff49  2026-08-06  notes: keep trishul 🔱 symbol in the Learning Notes (revert 🌌 there only)
+5d75ba3  2026-08-06  handoff: record COSMOS rebrand + repo rename; bump HEAD
+db03783  2026-08-06  rebrand: NATARAJA -> COSMOS across all docs, PDFs, and symbol (🔱 -> 🌌)
+c495a95  2026-08-06  notes: restructure header — trishul after NATARAJA, tagline + project summary
+439ca59  2026-08-06  notes: make NATARAJA the hero title (caps, bold), demote 'Learning Notes'
+19efe5d  2026-08-06  notes: fix stale header title (Stage-0.5 leftover)
+b9e0f5d  2026-08-06  handoff: deepening COMPLETE — all stages at full depth
+be21e9b  2026-08-06  notes: deepen Stage 12 (Observability, SRE & Capstone) — notebook now COMPLETE
+72047c4  2026-08-06  handoff: mark Stage 11 deepened; only Stage 12 remains
+99c17bc  2026-08-06  notes: deepen Stage 11 (Cloud, IaC & Multi-Region) to full lesson depth
+e1e9b85  2026-08-06  handoff: mark Stage 10 deepened; resume at Stage 11
+4476470  2026-08-06  notes: deepen Stage 10 (Preview Environments) to full lesson depth
+20fb95c  2026-08-06  docs: add SESSION-HANDOFF.md for cross-session continuity
+f841fa9  2026-08-06  docs(notes): rebuild Stage 9 (frontend & experimentation) at full depth
+a102542  2026-08-06  docs(notes): rebuild Stage 8 (K8s deep & operator) at full depth
+cbf5fea  2026-08-06  docs(notes): rebuild Stage 7 (internal comms & Go) at full depth
+1d05389  2026-08-06  docs(notes): rebuild Stage 6 (multi-tenancy & identity) at full depth
+c9b5d52  2026-08-06  docs(notes): rebuild Stage 5 (event backbone) at full depth
+6042820  2026-08-06  docs(notes): rebuild Stages 1-3 at full Lesson-1 depth
+620b273  2026-08-06  docs(notes): rebuild Stage 4 at full Lesson-1 depth
+aecc925  2026-08-06  docs(notes): deepen Stages 4-12 into full lessons — curriculum COMPLETE
+9c7a331  2026-08-06  docs(notes): deepen Stage 3 into 9 full lessons (the agent layer)
+0078982  2026-08-06  docs(notes): deepen Stage 2 into 6 full lessons (polyglot persistence)
+3de4270  2026-08-06  docs(notes): deepen Stage 1 into 6 full lessons (async core)
+9ca7983  2026-08-06  docs(notes): deepen Stage 0 into 6 full lessons (FastAPI & clean architecture)
+4138db3  2026-08-06  docs(notes): complete end-to-end curriculum (Stages 0-12)
+688e8fe  2026-08-06  docs: complete Stage 0.5 notes + study guide render + stage design specs
+9e4004f  2026-08-06  docs: add segmented Architecture Study Guide
+50892d1  2026-07-31  docs: add shareable PDF of the learning notes
+276de64  2026-07-31  docs(notes): add Lesson 2 — Types & Pydantic
+4b8fbe0  2026-07-31  docs(notes): add graded self-check (answers + feedback) to Lesson 1
+11d3fcd  2026-07-31  docs: add living learning-notes page (Stage 0.5, Lesson 1)
+27a3f36  2026-07-29  docs: re-theme visuals to Nataraja (ring of fire + cosmic palette)
+ab49bb4  2026-07-29  Rebrand project Helios -> Nataraja
+1bc3b3d  2026-07-29  docs: keep only the four deliverables, remove build sources
+46b8914  2026-07-29  docs: make 3-D stack view match the isometric slab template
+e315182  2026-07-29  docs: redesign architecture PDF in the clean light roadmap style
+291eeda  2026-07-29  docs: tighten 3-D stack view framing
+92edaa8  2026-07-29  docs: redesign architecture diagram — interactive flow + 3-D stack, with logos
+1b384b9  2026-07-29  docs: add end-to-end architecture flow diagram (HTML + PDF)
+2c1a328  2026-07-29  docs: add mentor-facing PDF roadmap + print source
+4fdcf5b  2026-07-29  docs: add interactive Helios learning roadmap (docs/roadmap.html)
+9e2e536  2026-07-29  docs: add depth-first learning plan and rename project to Helios
+dceb4ea  2026-07-29  Merge main into dev: sync git.md update and align branches
+c86e27e  2026-07-29  docs: add project planning and reference documentation
+bb8f275  2026-07-29  docs: add project planning and reference documentation
