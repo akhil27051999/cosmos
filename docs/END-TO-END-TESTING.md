@@ -307,6 +307,61 @@ python scripts/loadtest.py --url http://localhost:8000 --key "$KEY" --n 500 --co
 
 ---
 
+## Track E — Redis, exercised through its four use cases
+
+Redis is already integrated in four distinct roles. With the Compose stack up and
+a job submitted (`$KEY`, `$JID` from Track B):
+
+```bash
+cd services/gateway
+# a) Work queue (Redis Streams): stream 'cosmos:jobs', consumer group 'workers'
+docker compose exec redis redis-cli XLEN cosmos:jobs
+docker compose exec redis redis-cli XINFO GROUPS cosmos:jobs        # pending / lag per group
+
+# b) Cache-aside: GET a job populates a cached copy (invalidated on write, TTL backstop)
+curl -s localhost:8000/v1/jobs/$JID -H "Authorization: Bearer $KEY" >/dev/null
+docker compose exec redis redis-cli KEYS '*'                        # see cached job key(s)
+
+# c) Distributed rate-limit (token bucket via Lua): key 'ratelimit:submit'
+docker compose exec redis redis-cli HGETALL ratelimit:submit        # tokens + last-refill ts
+
+# d) Pub/sub for SSE: worker publishes agent steps to a per-job channel
+docker compose exec redis redis-cli PSUBSCRIBE 'jobs:*'             # then submit a job elsewhere
+```
+✅ You've now driven Redis as **queue, cache, rate-limiter, and pub/sub** — its
+four jobs in this platform.
+
+## Track F — Observability stack (Prometheus + PLG + Alerting)
+
+Not part of the app — a separate stack that consumes the `/metrics` + JSON-log
+feeds. Full runbook: [`../deploy/observability/README.md`](../deploy/observability/README.md).
+
+```bash
+# Cosmos must be up first (Track B.1). Then:
+cd deploy/observability
+docker compose -f docker-compose.observability.yaml up -d
+```
+- **Grafana** <http://localhost:3000> → dashboard **Cosmos → RED + Logs** (watch it move under `scripts/loadtest.py`).
+- **Prometheus** <http://localhost:9090> → Status→Targets (`cosmos-gateway` UP); try `histogram_quantile(0.95, sum by(le)(rate(http_request_duration_seconds_bucket[5m])))`.
+- **Loki** (Grafana → Explore) → `{container=~".*gateway.*"} | json | correlation_id=\`<id>\`` to trace one request across log lines.
+- **Alerting** → turn on chaos (`CHAOS_ENABLED=true CHAOS_FAULT_RATE=0.5` then `docker compose up -d gateway`), watch `HighErrorRate` fire on Prometheus **/alerts** and in **Alertmanager** (:9093).
+
+## Track G — ArgoCD (GitOps)
+
+Deploys the Helm chart from Git and self-heals drift. Full runbook:
+[`../deploy/argocd/README.md`](../deploy/argocd/README.md). Requires the minikube
+cluster + images from Track C.
+
+```bash
+kubectl create namespace argocd
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+kubectl -n argocd rollout status deploy/argocd-server
+kubectl apply -f deploy/argocd/application.yaml     # syncs deploy/helm/cosmos -> cluster
+```
+Then test: change a value in Git → auto-sync; `kubectl -n cosmos scale deploy/cosmos-gateway --replicas=5` → ArgoCD reverts it (self-heal).
+
+---
+
 ## 5-minute smoke (the essentials)
 
 ```bash

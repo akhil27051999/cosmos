@@ -20,7 +20,9 @@ cosmos-platform/
 │   ├── gateway/          # the API front door + worker (FastAPI, hexagonal architecture)
 │   └── operator/         # Kubernetes operator: reconciles CosmosTenant CRs (Stage 8 pt2)
 ├── deploy/
-│   └── helm/cosmos/      # Kubernetes Helm chart for the whole platform (Stage 8)
+│   ├── helm/cosmos/      # Kubernetes Helm chart for the whole platform (Stage 8)
+│   ├── observability/    # Prometheus + PLG + Alertmanager stack (run alongside Cosmos)
+│   └── argocd/           # ArgoCD Application (GitOps: sync the chart from Git)
 ├── docs/
 │   ├── STAGES.md              # what each stage adds + test/troubleshoot steps
 │   ├── END-TO-END-TESTING.md  # run + verify the whole platform locally
