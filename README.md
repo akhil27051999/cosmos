@@ -40,7 +40,8 @@ As later stages arrive, `services/` grows (e.g. a `worker/`), and a top-level
 | **6** | Multi-tenancy & identity: **API-key auth** (hashed keys), **tenant isolation** on every read/write, per-tenant **monthly quota** + usage ledger, admin bootstrap to mint tenants/keys. | ✅ built |
 | **7** | **OAuth2/OIDC** JWT bearer tokens as a second credential + **scope-based authZ** (`jobs:read`/`jobs:write`); **typed gRPC control-plane** contract (protobuf) between gateway and worker (`/v1/admin/worker/status`), behind a port so tests need no gRPC. | 🟢 pts 1–2 |
 | **8** | **Kubernetes**: a Helm chart (gateway + worker + backing stores, ConfigMap/Secret, probes, gateway **HPA**) **plus a custom operator** — a `CosmosTenant` **CRD** reconciled by a `kopf` controller that provisions tenants via the admin API and writes credentials to a Secret. | 🟢 pts 1–2 |
-| … | Go worker + service mesh → Saga/CDC → frontend/A-B → preview envs → cloud/multi-region → observability/SRE | ⬜ |
+| **9** | **A/B experimentation & feature flags**: deterministic, sticky, weighted variant assignment (hash-based, no stored state); exposure tracking; admin-managed experiments; `/v1/experiments/{key}/assignment` + `/results`. | ✅ built |
+| … | observability/SRE → Saga/CDC → Go worker + mesh → preview envs → cloud/multi-region | ⬜ |
 
 ## Quick start (Stage 0)
 

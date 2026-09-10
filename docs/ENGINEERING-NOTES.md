@@ -26,6 +26,7 @@
 5I. **Stage 7 (part 2)** — typed gRPC control plane (block-by-block)
 5J. **Stage 8 (part 1)** — Kubernetes packaging with Helm (block-by-block)
 5K. **Stage 8 (part 2)** — custom operator + CRD (block-by-block)
+5L. **Stage 9** — A/B experimentation & feature flags (block-by-block)
 6. Cross-cutting design decisions & trade-offs
 7. Interview Q&A — what / why / how
 8. Known gaps and what later stages fix
@@ -1161,6 +1162,66 @@ never minting a second tenant. That property is the whole design.
 
 ---
 
+## 5L. Stage 9 — A/B experimentation & feature flags (block-by-block)
+
+**Idea:** ship an **experimentation** capability — split traffic into weighted
+variants, decide each unit's variant **deterministically**, and record
+**exposures** so results are measurable. **Motive:** every product platform needs
+to roll out changes behind flags and A/B-test them; the interesting engineering is
+doing the assignment *without shared state* so it's correct across many replicas.
+
+**The core insight — assignment by hashing, not by dice or a database.** A naive
+A/B test rolls a random number per request (not sticky — a user flips variants) or
+stores each decision (a DB write on every call, and replicas must agree). Instead
+we compute the variant as a pure function of `(experiment_key, unit_id, weights)`
+via a hash. That's **deterministic** (same inputs → same variant), **sticky** (a
+tenant's experience is consistent), **stateless** (no storage, no coordination —
+every replica computes the same answer), and **independent** across experiments
+(the key is mixed into the hash).
+
+### 5L.1 `app/domain/experiment.py`
+- `Experiment` (key, status, weighted `Variant`s, each with a `config` payload of
+  what it changes), `ExperimentStatus` (draft/running/paused/completed), and a
+  frozen `Assignment`. `control` = the first variant, handed out whenever the
+  experiment isn't running. Pure data + rules; no hashing/DB/HTTP.
+
+### 5L.2 `app/experiments/bucketing.py` — the assignment function
+- `bucket_of(key, unit, mod)` = `int(sha256("key:unit")[:8], 16) % mod` — a stable
+  32-bit hash into the bucket space. `assign(exp, unit)`: not running → control;
+  running → hash into `[0, total_weight)` and walk variants by cumulative weight,
+  so each gets its configured share. Pure and unit-tested (stable + roughly
+  proportional + independent across keys).
+
+### 5L.3 Ports + adapters
+- `ExperimentStore` (definitions: add/get/list/set_status) and `ExposureLog`
+  (record/counts), each with memory + Postgres adapters. The exposure log is
+  **idempotent per `(experiment, unit)`** (Postgres `ON CONFLICT DO NOTHING`; a
+  set in memory), so a unit's first-seen variant sticks and `counts()` measures
+  **unique units per variant** — the denominator for comparing outcomes.
+
+### 5L.4 `app/application/experiment_service.py`
+- The use cases: create/list/activate, `assignment(key, unit, record=True)`
+  (resolve via `assign`, and record an exposure **only when the experiment is
+  running** — control-by-default isn't a real exposure), and `results(key)`
+  (per-variant counts + total). Unknown key → `ExperimentNotFound` (404).
+
+### 5L.5 API — `routes_experiments.py`
+- One router, two audiences: **admin** (X-Admin-Token) manages experiments and
+  reads `/results`; a **tenant** (API key / JWT with `jobs:read`) resolves
+  `/{key}/assignment` where the **unit is the tenant id** — so a tenant gets a
+  stable variant and each call records (idempotently) that it was exposed.
+
+> **Why the unit is the tenant here:** it makes a whole tenant's experience
+> consistent (every request from that tenant sees the same variant) and lets the
+> variant's `config` drive tenant-level behavior. A different granularity (per
+> end-user, per job) is just a different `unit_id` into the same function.
+
+> **Deferred:** *consuming* a variant's `config` to actually change behavior
+> (e.g. the worker picking the variant's model per job) and a web UI to visualize
+> results — both build straight on this assignment + exposure core.
+
+---
+
 ## 6. Cross-cutting design decisions & trade-offs
 
 | Decision | Why | Trade-off / later fix |
@@ -1220,6 +1281,10 @@ never minting a second tenant. That property is the whole design.
 | Credentials → CR-owned Secret | one-time API key persisted; GC'd with the CR | secret sits in etcd (encrypt at rest in prod) |
 | `kopf run --standalone` | no peering CRDs/RBAC; simple single instance | no multi-replica HA for the operator |
 | No deprovision on delete (yet) | ships the create path now | delete leaves the tenant → needs a finalizer + admin DELETE |
+| A/B assignment by hashing (not RNG/DB) | deterministic, sticky, stateless, replica-consistent | changing weights reshuffles buckets |
+| Exposure idempotent per (experiment, unit) | results = unique units, no double-count | re-exposure not counted (by design) |
+| Unit = tenant id | whole-tenant consistent experience | finer splits (per-user/job) need a different unit |
+| Not-running → everyone gets control | clean on/off; safe default | no partial ramp state (draft/paused only) |
 | LLM behind a port + scripted fake | tests run with no key/network/cost | one more abstraction layer |
 | Agent guardrails (token budget, max steps) | bound cost + prevent infinite loops | may stop before a hard task finishes |
 | SSE via Redis pub/sub | live progress across processes | live-only (no replay) until Stage 5-style history stream |
@@ -1604,6 +1669,28 @@ kopf handlers are thin glue that do the k8s I/O around it. So `pytest` exercises
 the create/idempotent/quota paths with a fake admin client and no cluster; the
 handler's k8s calls are validated live on minikube.
 
+**Q: How does your A/B assignment work, and why hashing? (Stage 9)**
+Each unit's variant is a pure function of `(experiment_key, unit_id, weights)`:
+hash "key:unit" to a 32-bit int, mod into `[0, total_weight)`, and walk the
+variants by cumulative weight. No random rolls, no stored decision. That gives me
+four properties for free: **deterministic** (reproducible), **sticky** (a tenant
+always sees the same variant), **stateless** (every gateway replica computes the
+same answer with zero coordination or DB lookups), and **independent** across
+experiments (the key is in the hash, so buckets don't correlate). It's the same
+idea as consistent-hashing a request to a variant.
+
+**Q: How do you measure an experiment?**
+An exposure log records `(experiment, unit) → variant`, idempotently — so a unit's
+first-seen variant sticks and `results` counts **unique units per variant**.
+That's the denominator; you'd join it against whatever outcome metric you care
+about (conversion, latency, success rate) to compare arms. Assignment records an
+exposure only while the experiment is actually running.
+
+**Q: What happens when you pause or haven't started an experiment?**
+Draft, paused, and completed all hand out **control** (the first variant) and
+record no new exposures. So flipping an experiment off cleanly reverts everyone to
+baseline — a safe kill switch — without deleting the definition or its results.
+
 ## 8. Known gaps and what later stages fix
 - **MongoDB trajectories + Redis hot state** (polyglot) → **Stage 2**. ✅ done
 - **Multi-store consistency** (Mongo+Postgres+Redis not atomic) → transactional **outbox + CDC**, **Stage 5**.
@@ -1629,6 +1716,9 @@ handler's k8s calls are validated live on minikube.
 - **Custom operator + CRD** (`CosmosTenant` reconciled to provision tenants/keys) → **Stage 8 part 2**. ✅ done
 - **Operator teardown** (finalizer + an admin DELETE-tenant endpoint so deleting a CR deprovisions) → follow-on.
 - **Production storage** (StatefulSets/managed DBs, backups, HA), **Ingress/TLS**, **NetworkPolicies**, **PodDisruptionBudgets** → hardening increments.
+- **A/B experimentation & feature flags** (deterministic sticky assignment, exposure tracking, admin experiments) → **Stage 9**. ✅ done
+- **Consuming a variant's config** to change behavior (e.g. worker picks the variant's model per job) + a **web UI** to visualize results → follow-ons on Stage 9.
+- **Observability** (structured logs, Prometheus `/metrics`, distributed tracing) → **Stage 10**.
 - **Per-tenant rate limits** (reuse the Stage-4 bucket keyed by tenant) → small follow-on.
 - **Quota check + usage record aren't atomic** (tiny overshoot under bursts) → acceptable for a coarse monthly quota; a stricter limit would reserve-then-commit.
 
@@ -1679,3 +1769,8 @@ handler's k8s calls are validated live on minikube.
 - **kopf** — a Python framework for writing k8s operators as decorated handler functions.
 - **ownerReference / GC** — links a child object to its owner so k8s deletes it when the owner goes away.
 - **finalizer** — a marker that blocks deletion until a controller runs teardown (a follow-on here).
+- **A/B test / experiment** — splitting units into variants to compare outcomes.
+- **variant / control** — an arm of an experiment / the baseline arm (first variant).
+- **sticky / deterministic assignment** — the same unit always gets the same variant, computed (here) by hashing rather than stored.
+- **exposure** — a recorded event that a unit was actually bucketed into a variant (the measurement denominator).
+- **feature flag** — a toggle that turns behavior on/off (a running/paused single-variant experiment is the degenerate case).

@@ -852,6 +852,67 @@ kubectl -n cosmos get secret acme-credentials -o jsonpath='{.data.api_key}' | ba
 
 ---
 
-## Stage 9 — frontend + experimentation ⬜ (next)
+## Stage 9 — A/B experimentation & feature flags ✅
 
-Will add a web frontend and A/B experimentation. Steps appended when it lands.
+**What it adds:** an experimentation service — split tenants into weighted
+variants, deterministically and stickily, and measure exposure.
+
+- **Deterministic, sticky assignment** (`app/experiments/bucketing.py`): `hash(experiment_key + unit_id) → weighted bucket`. Same tenant → same variant every time, on every replica, **with no stored state**. Different experiments bucket independently.
+- **Experiment** domain (key, description, status, weighted `Variant`s with a `config` payload) + `ExperimentStore` (memory/Postgres).
+- **Exposure log** — idempotent per `(experiment, unit)`, so `results` reports *unique units per variant*.
+- **API:** admin creates/lists/activates experiments and reads `/results`; a tenant resolves its own `/assignment` (which records an exposure while the experiment is running).
+- Not-running experiments (draft/paused/completed) hand everyone **control**, so toggling one off cleanly reverts to baseline.
+
+### Test steps
+
+**A. Automated**
+```bash
+cd services/gateway && source .venv/bin/activate && pytest -q
+```
+Expect **85 passed** (adds 9: bucketing is deterministic/sticky/proportional/independent; the full create→activate→assign→results HTTP flow; auth + 404 paths).
+
+**B. End-to-end (Docker)** — needs an admin token and a tenant key.
+```bash
+cd services/gateway
+export ADMIN_TOKEN=dev-admin-secret
+docker compose up -d --build
+until curl -sf localhost:8000/healthz >/dev/null; do sleep 1; done; echo ready
+
+# Create an experiment (admin) and activate it:
+curl -s -XPOST localhost:8000/v1/experiments -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -H 'content-type: application/json' -d '{
+    "key":"agent-model","description":"opus vs sonnet",
+    "variants":[{"name":"control","weight":1,"config":{"model":"opus"}},
+                {"name":"variant-a","weight":1,"config":{"model":"sonnet"}}]}' | python3 -m json.tool
+curl -s -XPOST localhost:8000/v1/experiments/agent-model/status \
+  -H "X-Admin-Token: $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d '{"status":"running"}' >/dev/null
+
+# A tenant resolves its variant (make a key first — see Stage 6). With $KEY set:
+curl -s localhost:8000/v1/experiments/agent-model/assignment \
+  -H "Authorization: Bearer $KEY" | python3 -m json.tool     # sticky variant + config
+# admin reads the split:
+curl -s localhost:8000/v1/experiments/agent-model/results -H "X-Admin-Token: $ADMIN_TOKEN" | python3 -m json.tool
+```
+
+**What to verify (learning checkpoints):**
+- Calling `/assignment` repeatedly for the same key returns the **same variant** (sticky).
+- Two different tenant keys can land in different variants; the `/results` counts reflect unique tenants exposed.
+- Setting status back to `paused` → `/assignment` returns `control` and stops recording new exposures.
+
+### Troubleshooting
+
+| Symptom | Cause & fix |
+|---|---|
+| `/assignment` always returns `control` | The experiment isn't `running` (draft/paused/completed give control by design). `POST /{key}/status {"status":"running"}`. |
+| `experiment_not_found` (404) | Wrong key, or it wasn't created on this instance/DB. `GET /v1/experiments` (admin) to list. |
+| Results count higher than expected | Exposures are unique per `(experiment, unit=tenant)`. More tenants calling `/assignment` = more counts; the same tenant is counted once. |
+| Variant "moved" after you edited weights | Changing weights reshuffles buckets (it's a pure function of key+unit+weights). Avoid changing weights mid-experiment; create a new key instead. |
+| Admin route → 401 | `/v1/experiments` create/list/status/results need `X-Admin-Token`; only `/assignment` uses a tenant key. |
+
+---
+
+## Stage 10 — observability & SRE ⬜ (next)
+
+Will add structured logging, Prometheus metrics (`/metrics`), and distributed
+tracing. Steps appended when it lands.
