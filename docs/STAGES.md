@@ -912,7 +912,58 @@ curl -s localhost:8000/v1/experiments/agent-model/results -H "X-Admin-Token: $AD
 
 ---
 
-## Stage 10 — observability & SRE ⬜ (next)
+## Stage 10 — observability & SRE ✅
 
-Will add structured logging, Prometheus metrics (`/metrics`), and distributed
-tracing. Steps appended when it lands.
+**What it adds:** the three pillars an operator needs — structured logs, metrics,
+and the request-correlation that seeds tracing.
+
+- **Structured JSON logging** (`app/observability/logging.py`): one JSON object per line, every line stamped with the request's **correlation id** — pivot on it in a log aggregator to see everything one request did. `LOG_FORMAT=text` for local reading.
+- **RED-metrics middleware** (`app/observability/middleware.py`, pure ASGI so it doesn't buffer SSE): **R**ate + **E**rrors (`http_requests_total{method,path,status}`), **D**uration (`http_request_duration_seconds` histogram → p50/p95/p99), plus in-flight gauge and a structured access log. The `path` label is the **route template** (`/v1/jobs/{job_id}`), not the raw URL, to bound cardinality.
+- **Prometheus `/metrics`** (`app/observability/metrics.py`): a dependency-free registry (Counter/Gauge/Histogram) that renders the real text exposition format. Also a domain metric, `jobs_submitted_total`.
+
+> Dependency-free on purpose (keeps tests hermetic + shows the exposition format). In production you'd swap in `prometheus_client` / an OpenTelemetry SDK exporting to a collector — the scrape format on the wire is identical.
+
+### Test steps
+
+**A. Automated**
+```bash
+cd services/gateway && source .venv/bin/activate && pytest -q
+```
+Expect **93 passed** (adds 8: counter/histogram/label-escaping in the registry; `/metrics` returns Prometheus text; a request is counted by route template; `jobs_submitted_total` increments; JSON log formatter emits valid JSON with `correlation_id`; `configure_logging` is idempotent).
+
+**B. End-to-end (Docker)**
+```bash
+cd services/gateway && docker compose up -d --build
+until curl -sf localhost:8000/healthz >/dev/null; do sleep 1; done; echo ready
+
+# generate a little traffic, then scrape:
+curl -s localhost:8000/healthz >/dev/null
+curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/v1/jobs   # 401 (no key) — still counted
+curl -s localhost:8000/metrics | grep -E '^http_requests_total|^http_request_duration_seconds_(count|sum)|^jobs_submitted_total'
+```
+You'll see per-route counters and the latency histogram. Watch the structured logs:
+```bash
+docker compose logs --tail=20 gateway    # JSON lines: {"ts":...,"level":"INFO","msg":"request","correlation_id":"...","http_path":"/healthz",...}
+```
+
+**What to verify (learning checkpoints):**
+- `/metrics` groups by **route template** — hitting `/v1/jobs/<many-different-ids>` produces ONE `path="/v1/jobs/{job_id}"` series, not one per id.
+- Every log line carries the same `correlation_id` as the `X-Request-ID` response header for that request (send `-H 'X-Request-ID: my-trace-1'` and grep the logs for it).
+- The duration histogram's `_bucket`/`_sum`/`_count` are present (that's what a dashboard turns into p95).
+
+### Troubleshooting
+
+| Symptom | Cause & fix |
+|---|---|
+| `/metrics` counts explode with thousands of series | A raw path leaked into the `path` label. It should be the route template; unmatched routes bucket under `__unmatched__`. Check `_route_template` in the middleware. |
+| Logs are plain text, not JSON | `LOG_FORMAT` isn't `json` (default is json). `export LOG_FORMAT=json` then `docker compose up -d` (env-only → no `--build`). |
+| `correlation_id` is `-` in a log line | That code ran outside a request (startup/background task) — expected. Within a request it's set by the correlation middleware, which is outermost. |
+| SSE stream (`/v1/jobs/{id}/stream`) hangs after adding metrics | The metrics middleware must be **pure ASGI** (it is) — `BaseHTTPMiddleware` would buffer the stream. Don't convert it. |
+| Prometheus scrape rejects `/metrics` | Content-Type must be `text/plain; version=0.0.4`. It is; if you proxy it, don't let the proxy rewrite the type. |
+
+---
+
+## Stage 11 — Saga / distributed transactions ⬜ (next)
+
+Will add a saga orchestrator for multi-step workflows with compensating actions.
+Steps appended when it lands.

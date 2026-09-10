@@ -27,6 +27,7 @@
 5J. **Stage 8 (part 1)** — Kubernetes packaging with Helm (block-by-block)
 5K. **Stage 8 (part 2)** — custom operator + CRD (block-by-block)
 5L. **Stage 9** — A/B experimentation & feature flags (block-by-block)
+5M. **Stage 10** — observability & SRE (block-by-block)
 6. Cross-cutting design decisions & trade-offs
 7. Interview Q&A — what / why / how
 8. Known gaps and what later stages fix
@@ -1222,6 +1223,69 @@ every replica computes the same answer), and **independent** across experiments
 
 ---
 
+## 5M. Stage 10 — observability & SRE (block-by-block)
+
+**Idea:** make the platform *operable* — you can't run what you can't see. Ship
+the operator's three signals: **structured logs**, **metrics**, and the
+**correlation id** that ties a request's story together (and seeds tracing).
+**Motive:** this is the SRE surface — dashboards, alerts, and "why is p95 up?"
+all come from here. Notably, **no application behavior changes** — observability
+is cross-cutting, added at the edges (middleware + a metrics endpoint).
+
+**The framing — RED metrics.** For a request-driven service the canonical signals
+are **R**ate, **E**rrors, **D**uration. One middleware records all three per route,
+so any dashboard/alert can be built from them.
+
+### 5M.1 `app/observability/metrics.py` — a Prometheus-format registry
+- Hand-rolled `Counter` / `Gauge` / `Histogram` with labels, plus `render()` that
+  emits the **Prometheus text exposition format** (`# HELP`/`# TYPE`, `name{labels}
+  value`, and a histogram's `_bucket{le=…}`/`_sum`/`_count`). The histogram keeps
+  **cumulative** bucket counts (each observation bumps every bucket ≥ it), which is
+  exactly what `_bucket{le=…}` series and p95 queries expect. **Dependency-free**
+  on purpose: hermetic tests + the format is explicit. Prod swaps in
+  `prometheus_client`/OpenTelemetry — identical bytes on the wire.
+
+### 5M.2 `app/observability/logging.py` — structured JSON logs
+- A `JsonFormatter` emits one JSON object per line — `ts, level, logger, msg,
+  correlation_id` plus any `extra={}` fields — so an aggregator can index and
+  pivot on `correlation_id`. `configure_logging()` is **idempotent** (clears
+  handlers first) because the app factory runs per test. A text mode exists for
+  local reading.
+
+### 5M.3 `app/observability/middleware.py` — RED + access log
+- A **pure ASGI** middleware (deliberately NOT `BaseHTTPMiddleware`, which buffers
+  the body and would break the SSE stream): it times each request, bumps the
+  in-flight gauge, reads the status from the `http.response.start` message,
+  records `http_requests_total` + the duration histogram, and logs a structured
+  access line. The `path` label is the **matched route template**
+  (`/v1/jobs/{job_id}`), never the raw URL — otherwise every id becomes its own
+  series and **cardinality explodes** (the classic metrics footgun). Unmatched
+  routes bucket under `__unmatched__`.
+
+### 5M.4 `app/api/routes_metrics.py` — `GET /metrics`
+- Serves the registry in `text/plain; version=0.0.4`. **Unauthenticated by
+  convention** (Prometheus scrapes it; you restrict it at the network layer in
+  prod) and it exposes only aggregate counters, never tenant data.
+
+### 5M.5 Wiring (`main.py`) — order matters
+- `configure_logging()` runs first. Then middleware is added so the **correlation
+  id is set before the metrics access log fires**: added last = outermost = runs
+  first, so `CorrelationIdMiddleware` is added *after* `MetricsMiddleware`
+  (correlation outer, metrics inner). A domain counter, `jobs_submitted_total`,
+  is incremented in the submit route to show app-level metrics alongside the HTTP
+  RED ones.
+
+> **Correlation id → tracing:** the id (honored from `X-Request-ID` or minted) is
+> already propagated and logged. Full distributed tracing — spans + a W3C
+> `traceparent` + an OTel exporter to Jaeger/Tempo — is the natural next
+> increment; the correlation id is the seed it grows from.
+
+> **Worker observability:** this stage instruments the gateway (HTTP). The worker
+> already exposes health/metrics-ish state over its gRPC control plane (Stage 7);
+> giving it a Prometheus `/metrics` too is a small follow-on.
+
+---
+
 ## 6. Cross-cutting design decisions & trade-offs
 
 | Decision | Why | Trade-off / later fix |
@@ -1285,6 +1349,12 @@ every replica computes the same answer), and **independent** across experiments
 | Exposure idempotent per (experiment, unit) | results = unique units, no double-count | re-exposure not counted (by design) |
 | Unit = tenant id | whole-tenant consistent experience | finer splits (per-user/job) need a different unit |
 | Not-running → everyone gets control | clean on/off; safe default | no partial ramp state (draft/paused only) |
+| RED metrics via one middleware | rate/errors/duration for free, per route | one more layer on the request path |
+| Metrics labelled by route template | bounded cardinality | needs the matched route (unmatched → constant) |
+| Pure-ASGI metrics middleware | doesn't buffer → SSE keeps streaming | more manual than BaseHTTPMiddleware |
+| Dependency-free metrics registry | hermetic tests; exposition format explicit | reimplements what prometheus_client gives (swap for prod) |
+| Structured JSON logs + correlation id | pivotable in an aggregator; seeds tracing | noisier than plain text locally (text mode exists) |
+| `/metrics` unauthenticated | standard scrape model | must be network-restricted in prod |
 | LLM behind a port + scripted fake | tests run with no key/network/cost | one more abstraction layer |
 | Agent guardrails (token budget, max steps) | bound cost + prevent infinite loops | may stop before a hard task finishes |
 | SSE via Redis pub/sub | live progress across processes | live-only (no replay) until Stage 5-style history stream |
@@ -1691,6 +1761,34 @@ Draft, paused, and completed all hand out **control** (the first variant) and
 record no new exposures. So flipping an experiment off cleanly reverts everyone to
 baseline — a safe kill switch — without deleting the definition or its results.
 
+**Q: How would you know if this service is healthy in production? (Stage 10)**
+The RED signals, exposed on `/metrics` for Prometheus: **Rate** and **Errors** from
+`http_requests_total{method,path,status}` (error rate = share of 5xx/4xx), and
+**Duration** from the `http_request_duration_seconds` histogram (p50/p95/p99). Plus
+an in-flight gauge for concurrency. Alerts hang off those (e.g. p95 > X, error rate
+> Y), and the structured JSON logs — pivoted by `correlation_id` — are how you
+drill into a specific bad request.
+
+**Q: Why label metrics by route template, not the URL?**
+Cardinality. `/v1/jobs/{job_id}` has millions of possible URLs; if each became its
+own label value the metric would explode and take Prometheus down with it. Labeling
+by the matched **route template** collapses them into one series per endpoint —
+the number-one metrics footgun, avoided.
+
+**Q: Why did you hand-roll the metrics instead of using prometheus_client?**
+To keep the learning build's tests dependency-free and to make the exposition
+format explicit — you can see exactly what a counter/gauge/histogram render as.
+It's a drop-in concern: production swaps in `prometheus_client` or an OpenTelemetry
+SDK exporting to a collector, and the scrape output is byte-identical, so nothing
+downstream changes.
+
+**Q: How does this connect to distributed tracing?**
+Every request already carries a **correlation id** (honored from `X-Request-ID` or
+minted), set in a ContextVar, echoed on the response, and stamped on every log
+line. That's the seed: full tracing adds spans and a W3C `traceparent` propagated
+to downstream services with an OTel exporter to Jaeger/Tempo — but the "one id
+threads a request across logs/services" mechanism is already here.
+
 ## 8. Known gaps and what later stages fix
 - **MongoDB trajectories + Redis hot state** (polyglot) → **Stage 2**. ✅ done
 - **Multi-store consistency** (Mongo+Postgres+Redis not atomic) → transactional **outbox + CDC**, **Stage 5**.
@@ -1718,7 +1816,9 @@ baseline — a safe kill switch — without deleting the definition or its resul
 - **Production storage** (StatefulSets/managed DBs, backups, HA), **Ingress/TLS**, **NetworkPolicies**, **PodDisruptionBudgets** → hardening increments.
 - **A/B experimentation & feature flags** (deterministic sticky assignment, exposure tracking, admin experiments) → **Stage 9**. ✅ done
 - **Consuming a variant's config** to change behavior (e.g. worker picks the variant's model per job) + a **web UI** to visualize results → follow-ons on Stage 9.
-- **Observability** (structured logs, Prometheus `/metrics`, distributed tracing) → **Stage 10**.
+- **Observability** (structured logs, RED metrics, Prometheus `/metrics`) → **Stage 10**. ✅ done
+- **Distributed tracing** (OTel spans + W3C `traceparent` + Jaeger/Tempo exporter) and **worker `/metrics`** → follow-ons on Stage 10.
+- **Saga / compensating transactions** for multi-step workflows → **Stage 11**.
 - **Per-tenant rate limits** (reuse the Stage-4 bucket keyed by tenant) → small follow-on.
 - **Quota check + usage record aren't atomic** (tiny overshoot under bursts) → acceptable for a coarse monthly quota; a stricter limit would reserve-then-commit.
 
@@ -1774,3 +1874,9 @@ baseline — a safe kill switch — without deleting the definition or its resul
 - **sticky / deterministic assignment** — the same unit always gets the same variant, computed (here) by hashing rather than stored.
 - **exposure** — a recorded event that a unit was actually bucketed into a variant (the measurement denominator).
 - **feature flag** — a toggle that turns behavior on/off (a running/paused single-variant experiment is the degenerate case).
+- **RED metrics** — Rate, Errors, Duration: the core signals for a request-driven service.
+- **Prometheus exposition format** — the `# TYPE`/`name{labels} value` text a scraper reads at `/metrics`.
+- **counter / gauge / histogram** — monotonic total / up-down value / bucketed distribution (for percentiles).
+- **cardinality** — the number of distinct label-value series; unbounded labels (raw URLs, ids) blow it up.
+- **structured logging** — one machine-parseable object per line, pivotable by fields like `correlation_id`.
+- **distributed tracing / span / traceparent** — following one request across services via propagated ids (the next increment).
