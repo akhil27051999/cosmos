@@ -23,6 +23,7 @@
 5F. **Stage 5 (part 2)** — CQRS read model (block-by-block)
 5G. **Stage 6** — multi-tenancy & identity (block-by-block)
 5H. **Stage 7 (part 1)** — OAuth2/OIDC JWT + scopes (block-by-block)
+5I. **Stage 7 (part 2)** — typed gRPC control plane (block-by-block)
 6. Cross-cutting design decisions & trade-offs
 7. Interview Q&A — what / why / how
 8. Known gaps and what later stages fix
@@ -951,9 +952,79 @@ produce the same `Principal`.
 > every existing Stage-0–6 route and test behaves exactly as before; only JWTs are
 > constrained by their token's scopes.
 
-> **Deferred to Stage 7 part 2 / later:** RS256 + JWKS (real OIDC provider), key
-> rotation/expiry for API keys, finer scopes (per-tenant admin, read-only keys),
-> and extracting the worker into its own gRPC service.
+> **Deferred to later:** RS256 + JWKS (real OIDC provider), key rotation/expiry
+> for API keys, finer scopes (per-tenant admin, read-only keys).
+
+---
+
+## 5I. Stage 7 (part 2) — typed gRPC control plane (block-by-block)
+
+**Idea:** give the gateway and worker a **typed, versioned contract** to talk over
+— gRPC/protobuf — for **control-plane** operations (health, metrics). **Motive:**
+so far the two processes only shared a Redis queue (fire-and-forget). A real
+platform also needs synchronous, strongly-typed service-to-service calls, and gRPC
+is the industry-standard for that: define the interface once in a `.proto`, and
+`protoc` generates matching types + stubs for every language, so the wire format
+can never drift between client and server.
+
+**The key design line — data plane vs control plane:**
+- **Data plane** (submitting/dispatching jobs) stays **asynchronous** over the
+  Redis queue — that's what gives accept-fast and decoupling; a synchronous RPC
+  there would reintroduce coupling and back-pressure.
+- **Control plane** (is the worker healthy? how many jobs in flight?) is
+  **synchronous gRPC** — a request/response question with a typed answer.
+Choosing the right communication style per concern is the whole lesson here.
+
+### 5I.1 `proto/worker_control.proto` — the contract
+- A versioned package (`cosmos.worker.v1`) and one service, `WorkerControl`, with
+  `GetStatus(GetStatusRequest) → GetStatusReply` (worker_id, uptime, in_flight,
+  processed_total, healthy). This file — not any Python — is the source of truth;
+  a breaking change ships as `v2` alongside `v1`.
+
+### 5I.2 `app/ports/worker_control.py` + `domain/worker_status.py`
+- The gateway depends on a **port** (`WorkerControlClient.get_status() ->
+  WorkerStatus`), never on gRPC directly. `WorkerStatus` is a plain domain
+  dataclass, kept separate from the generated protobuf type (the adapter
+  translates). Same hexagonal move as every other external dependency.
+
+### 5I.3 Adapters — fake + real
+- **In-memory** (`adapters/memory/worker_control.py`): returns a settable
+  `WorkerStatus`. Tests and local runs use it — **no gRPC required**.
+- **Real gRPC** (`adapters/grpc/worker_control.py`): a `GrpcWorkerControlClient`
+  (lazy channel/stub) and a `serve_worker_control(port, snapshot)` server helper.
+  Both **import `grpc` and the generated stubs lazily**, so nothing on the test
+  import path pulls in gRPC. The generated `*_pb2` modules import each other by
+  bare name, so the adapter puts their directory on `sys.path` before importing —
+  the simplest way to consume protoc's Python output regardless of package layout.
+
+### 5I.4 Codegen — build-time, not committed
+- The Dockerfile runs `python -m grpc_tools.protoc … proto/worker_control.proto`
+  into `app/adapters/grpc/gen/` (gitignored). Generated code isn't source, so it
+  doesn't belong in git; the build regenerates it, and the same command is
+  documented for local runs. `grpcio`/`grpcio-tools` are in requirements but only
+  the runtime (`grpcio`) is needed to *run*, and neither is needed to *test*.
+
+### 5I.5 The worker side — metrics + server
+- A tiny `WorkerMetrics` holder tracks `in_flight` (bumped around each
+  `process_job`) and `processed_total`; `snapshot()` produces a `WorkerStatus`.
+  `run_worker` starts the gRPC server as one more background component alongside
+  the relay and projector — **best-effort**: if gRPC/codegen isn't available it
+  logs and keeps the data plane running (the queue loop never depends on it).
+
+### 5I.6 The gateway side — route + failure mapping
+- `GET /v1/admin/worker/status` (on the admin plane — operational, cross-tenant)
+  depends on the port, calls the worker, and returns `WorkerStatusOut`. A
+  transport failure becomes a clean **503 `service_unavailable`** (new
+  `ServiceUnavailable` domain error) rather than a 500 — honest about "a
+  dependency I call synchronously is down".
+
+> **Why not commit the generated stubs?** They're build artifacts tied to the
+> grpc runtime version; committing them invites drift and merge noise. Generating
+> at build time keeps git clean and the stubs in lockstep with `grpcio`.
+
+> **Deferred (Stage 8+):** rewriting the worker in Go behind the *same* proto
+> (the contract makes the language swap transparent to the gateway), mutual-TLS
+> between services, and a service mesh.
 
 ---
 
@@ -998,6 +1069,11 @@ produce the same `Principal`.
 | Reject `alg:none`/non-HS256 explicitly | blocks JWT alg-confusion forgery | must pin the algorithm, not trust the header |
 | Scope-based authZ (`require_scope`) | least privilege; authN vs authZ separated | scopes to define/assign; API keys are full-access for now |
 | API keys granted **all** scopes | Stage 0–6 stays backward-compatible | no read-only API keys yet (a later refinement) |
+| gRPC for the control plane, queue for the data plane | right comm style per concern; typed status RPC | two transports to operate |
+| Typed `.proto` contract (schema-first) | client/server can't drift; polyglot-ready | a codegen build step |
+| gRPC client/server behind a port (lazy) | tests need no grpc; adapter swappable | real path only exercised in Docker/e2e |
+| Generated stubs built, not committed | git stays clean; stubs match the runtime | fresh local run needs codegen first |
+| Worker unreachable → 503, gRPC start best-effort | honest failure; data plane never blocked on control plane | status can be briefly unavailable after boot |
 | LLM behind a port + scripted fake | tests run with no key/network/cost | one more abstraction layer |
 | Agent guardrails (token budget, max steps) | bound cost + prevent infinite loops | may stop before a hard task finishes |
 | SSE via Redis pub/sub | live progress across processes | live-only (no replay) until Stage 5-style history stream |
@@ -1296,6 +1372,35 @@ codes stay distinct. Submit/cancel require `jobs:write`, reads require
 `jobs:read`; API keys carry all scopes, JWTs carry whatever the `scope` claim
 granted — least privilege for tokens.
 
+**Q: The gateway and worker share a queue — why add gRPC too? (Stage 7 pt2)**
+Different communication styles for different concerns. The **data plane**
+(dispatching jobs) is asynchronous over the Redis queue — that's what gives
+accept-fast and decoupling; making it a synchronous call would reintroduce
+coupling and back-pressure. The **control plane** (health, in-flight count) is a
+request/response *question*, which is exactly what synchronous **gRPC** is for. So
+jobs flow over the queue; `GET /v1/admin/worker/status` calls the worker over gRPC.
+
+**Q: Why gRPC/protobuf and not just another REST endpoint on the worker?**
+A `.proto` is a single, **versioned, typed contract** that generates matching
+client and server code for any language — so the two services can't drift, and I
+could rewrite the worker in Go behind the *same* proto without the gateway
+noticing. gRPC also gives HTTP/2 multiplexing and streaming for free. For a
+strongly-typed internal service-to-service call, that beats hand-rolled JSON.
+
+**Q: gRPC needs codegen and a C-extension — how do your tests still run without
+it?**
+The same ports pattern as every external dependency. The gateway depends on a
+`WorkerControlClient` **port**; tests inject an in-memory fake, so `pytest` never
+imports `grpc`. The real adapter imports gRPC and the generated stubs **lazily**,
+and the stubs are generated at **Docker build time** (gitignored, not committed).
+`grpcio` is only needed to *run* the real path, never to *test*.
+
+**Q: What happens if the worker is down when the gateway asks for status?**
+The gRPC call fails and the route maps it to a clean **503 `service_unavailable`**
+(not a 500). And on the worker side, starting the gRPC server is best-effort: if
+it can't start, the worker logs it and keeps processing jobs — the data plane
+never depends on the control plane.
+
 ## 8. Known gaps and what later stages fix
 - **MongoDB trajectories + Redis hot state** (polyglot) → **Stage 2**. ✅ done
 - **Multi-store consistency** (Mongo+Postgres+Redis not atomic) → transactional **outbox + CDC**, **Stage 5**.
@@ -1315,7 +1420,8 @@ granted — least privilege for tokens.
 - **OAuth2/OIDC (JWT) as a second principal source** + **scope-based authorization** → **Stage 7 part 1**. ✅ done
 - **RS256 + JWKS** (verify tokens from a real OIDC provider, not just HS256) → Stage 7 later increment (slots into `decode_and_verify`).
 - **Read-only / scoped API keys** and **key rotation/expiry** → later (API keys are full-access today).
-- **Worker as its own (gRPC) service** → **Stage 7 part 2**.
+- **Typed gRPC control-plane contract** (gateway↔worker status/health) → **Stage 7 part 2**. ✅ done
+- **Rewrite the worker in Go** behind the same proto, **mutual-TLS**, **service mesh** → Stage 8+.
 - **Per-tenant rate limits** (reuse the Stage-4 bucket keyed by tenant) → small follow-on.
 - **Quota check + usage record aren't atomic** (tiny overshoot under bursts) → acceptable for a coarse monthly quota; a stricter limit would reserve-then-commit.
 
@@ -1349,3 +1455,8 @@ granted — least privilege for tokens.
 - **JWKS** — the JSON Web Key Set an OIDC provider publishes so verifiers can fetch its public keys (RS256).
 - **Scope** — a permission string a credential carries (`jobs:read`); the unit of authorization.
 - **alg confusion** — a JWT attack that swaps the signing algorithm (e.g. to `none`); defeated by pinning the expected alg.
+- **gRPC** — a high-performance RPC framework over HTTP/2 with typed contracts.
+- **protobuf / `.proto`** — the schema language defining messages + services; compiled by `protoc` into per-language stubs.
+- **codegen / stub** — generated client/server code from the `.proto` (the `*_pb2*.py` files).
+- **data plane vs control plane** — the path that carries the work (async queue) vs the path that manages/observes it (sync gRPC).
+- **servicer / stub** — the server-side implementation of a gRPC service vs the client-side proxy that calls it.

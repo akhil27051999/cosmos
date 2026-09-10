@@ -656,7 +656,72 @@ returns **401** with `WWW-Authenticate: Bearer`.
 
 ---
 
-## Stage 7 — part 2 (worker as its own gRPC service) ⬜ (next)
+## Stage 7 — part 2 (typed gRPC control plane) ✅
 
-Will extract the worker into a standalone deployable with a typed gRPC contract
-between it and the gateway. Steps appended when it lands.
+**What it adds:** a **typed gRPC contract** between the gateway and the worker.
+The **data plane stays async** (jobs still flow over the Redis queue —
+accept-fast, decoupled); gRPC is the **control plane**: synchronous operational
+queries. The worker exposes a `WorkerControl` service; the gateway calls it and
+serves the result at `GET /v1/admin/worker/status`.
+
+- `proto/worker_control.proto` — the schema-first, versioned contract (`cosmos.worker.v1`); `protoc` generates matching stubs so client/server can't drift.
+- `app/ports/worker_control.py` + `WorkerStatus` — the gateway depends on a **port**, not on gRPC. In-memory fake (tests) + real gRPC adapter (`app/adapters/grpc/worker_control.py`, **lazy** import of `grpc` and the generated stubs).
+- The worker tracks live metrics (`in_flight`, `processed_total`, uptime) and serves them over gRPC; the gateway route maps an unreachable worker to a clean **503**.
+- Stubs are generated at **Docker build time** (not committed); `pytest` never imports gRPC — the fake satisfies the port, same convention as Redpanda/Mongo/Anthropic.
+
+### Test steps
+
+**A. Automated**
+```bash
+cd services/gateway && source .venv/bin/activate && pytest -q
+```
+Expect **76 passed** (adds 5: metrics→status snapshot, admin-gated route, status payload via the fake, 503 when the worker is unreachable, and "importing the app doesn't import grpc"). No `grpcio` needed to run the tests.
+
+**B. Generate the stubs locally (only if you want to run the worker outside Docker)**
+```bash
+cd services/gateway
+pip install grpcio grpcio-tools          # runtime + codegen (already in requirements.txt)
+mkdir -p app/adapters/grpc/gen
+python -m grpc_tools.protoc -I proto \
+  --python_out=app/adapters/grpc/gen \
+  --grpc_python_out=app/adapters/grpc/gen \
+  proto/worker_control.proto
+# (app/adapters/grpc/gen/ is gitignored; the Docker build runs this same command)
+```
+
+**C. End-to-end (Docker)** — the build generates stubs; the worker serves gRPC on 50051.
+```bash
+cd services/gateway
+export ADMIN_TOKEN=dev-admin-secret
+docker compose up -d --build
+until curl -sf localhost:8000/healthz >/dev/null; do sleep 1; done; echo ready
+sleep 3   # give the worker's gRPC server a moment to bind
+
+# The gateway calls the worker over gRPC and returns its live status:
+curl -s localhost:8000/v1/admin/worker/status \
+  -H "X-Admin-Token: $ADMIN_TOKEN" | python3 -m json.tool
+# -> {"worker_id": "...", "uptime_seconds": ..., "in_flight": 0, "processed_total": N, "healthy": true}
+```
+Submit a few jobs (see Stage 6/7pt1), then re-check — `processed_total` climbs.
+Optional, hit the worker's gRPC directly from the host with grpcurl:
+```bash
+grpcurl -plaintext -import-path proto -proto worker_control.proto \
+  localhost:50051 cosmos.worker.v1.WorkerControl/GetStatus
+```
+
+### Troubleshooting
+
+| Symptom | Cause & fix |
+|---|---|
+| `/v1/admin/worker/status` → **503 `service_unavailable`** | The worker's gRPC server isn't up (still starting, crashed, or `WORKER_GRPC_TARGET` wrong). Check `docker compose logs worker` for "gRPC control plane on :50051"; give it a few seconds after `up`. |
+| Worker logs "gRPC control plane unavailable … (data plane still running)" | Codegen didn't run / stubs missing in the image. Rebuild with `--build`; confirm the Dockerfile's `grpc_tools.protoc` step ran. The worker keeps processing jobs regardless. |
+| `ModuleNotFoundError: worker_control_pb2` running the worker locally | You skipped local codegen — run step B, or just use Docker. |
+| `pytest` fails importing grpc | It shouldn't — nothing in the test path imports gRPC. If it does, something imported `app.adapters.grpc.worker_control` directly; use the port + fake instead. |
+| Route → 401 | `/v1/admin/*` needs `X-Admin-Token` (the admin plane), not an API key. |
+
+---
+
+## Stage 8 — Kubernetes & an operator ⬜ (next)
+
+Will containerize for k8s (manifests/Helm) and introduce a custom operator/CRD to
+manage the platform. Steps appended when it lands.
