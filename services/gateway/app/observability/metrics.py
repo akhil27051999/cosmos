@@ -69,6 +69,10 @@ class Counter(_Metric):
     def value(self, **labels: str) -> float:
         return self._values.get(self._key(labels), 0.0)
 
+    def collect(self) -> list[tuple[dict, float]]:
+        """Every series as (labels dict, value) — used by the SLO computation."""
+        return [(dict(zip(self.labelnames, key)), val) for key, val in self._values.items()]
+
     def render(self) -> list[str]:
         out = [f"# HELP {self.name} {self.help}", f"# TYPE {self.name} counter"]
         for key, val in sorted(self._values.items()):
@@ -123,6 +127,19 @@ class Histogram(_Metric):
                     counts[i] += 1
             self._sum[key] = self._sum.get(key, 0.0) + value
             self._count[key] = self._count.get(key, 0) + 1
+
+    def collect(self) -> list[dict]:
+        """Per-series {labels, buckets:{le: cumulative_count}, count, sum} — the
+        SLO computation reads cumulative bucket counts to get 'fraction under X'."""
+        out = []
+        for key, counts in self._counts.items():
+            out.append({
+                "labels": dict(zip(self.labelnames, key)),
+                "buckets": {b: counts[i] for i, b in enumerate(self._buckets)},
+                "count": self._count[key],
+                "sum": self._sum[key],
+            })
+        return out
 
     def render(self) -> list[str]:
         out = [f"# HELP {self.name} {self.help}", f"# TYPE {self.name} histogram"]
